@@ -39,6 +39,8 @@ TIER=$(cat "${BOOTSTRAP_DIR}/tier.txt" 2>/dev/null || echo "seed")
 DEFAULT_MODEL=$(cat "${BOOTSTRAP_DIR}/default_model.txt" 2>/dev/null || echo "gpt-5-nano")
 PAYPERQ_KEY=$(cat "${BOOTSTRAP_DIR}/payperq_key.txt" 2>/dev/null || echo "")
 NOSCHA_TOKEN=$(cat "${BOOTSTRAP_DIR}/noscha_mgmt_token.txt" 2>/dev/null || echo "")
+PERSONALITY=$(cat "${BOOTSTRAP_DIR}/personality.txt" 2>/dev/null || echo "professional")
+MISSION=$(cat "${BOOTSTRAP_DIR}/mission.txt" 2>/dev/null || echo "")
 DATE=$(date -u +%Y-%m-%d)
 DISPLAY_NAME=$(echo "${AGENT_NAME}" | sed 's/\b\(.\)/\u\1/g')
 
@@ -346,7 +348,9 @@ replace_placeholders() {
         | sed "s|__LN_ADDRESS__|${LN_ADDRESS}|g" \
         | sed "s|__NOSCHA_DOMAIN__|${NOSCHA_DOMAIN}|g" \
         | sed "s|__CREATED_AT__|${CREATED_AT}|g" \
-        | sed "s|__WEBCHAT_URL__|${WEBCHAT_URL}|g"
+        | sed "s|__WEBCHAT_URL__|${WEBCHAT_URL}|g" \
+        | sed "s|__PERSONALITY__|${PERSONALITY}|g" \
+        | sed "s|__MISSION__|${MISSION}|g"
 }
 
 TEMPLATES_WRITTEN=0
@@ -397,9 +401,9 @@ if [ -n "${PAYPERQ_KEY}" ]; then
     echo "  External PayPerQ key provided — skipping PPQ account creation"
 elif [ -f "${BOOTSTRAP_DIR}/ppq_provision.py" ]; then
     echo "  No external key — creating PPQ account on the agent's behalf..."
-    # Create account (dry-run: no funding — create_vm.py handles payment)
+    # Create account only — funding handled separately by provisioning system
     python3 "${BOOTSTRAP_DIR}/ppq_provision.py" \
-        --dry-run \
+        --create-only \
         --output "${PPQ_CREDENTIALS}" 2>&1 || {
         echo "  WARNING: PPQ provisioning failed"
     }
