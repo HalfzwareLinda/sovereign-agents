@@ -1,0 +1,37 @@
+{
+  "auth": {
+    "profiles": {
+      "openai:default": {
+        "provider": "openai",
+        "mode": "token"
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "models": {
+        "__DEFAULT_MODEL__": {}
+      },
+      "compaction": {
+        "mode": "default",
+        "memoryFlush": {
+          "enabled": true
+        }
+      }
+    },
+    "list": [
+      {
+        "id": "main",
+        "default": true
+      }
+    ]
+  },
+  "gateway": {
+    "mode": "local"
+  },
+  "session": {
+    "reset": {
+      "idleMinutes": 120
+    }
+  }
+}
