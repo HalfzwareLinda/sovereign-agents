@@ -47,15 +47,6 @@ python provision_agent.py --name "myagent" --parent-npub "npub1..." --dry-run
 python provision_agent.py --name "myagent" --parent-npub "npub1..." --tier small
 ```
 
-## VPS Tiers (via LNVPS)
-
-| Tier | Specs | Monthly Cost |
-|------|-------|-------------|
-| demo | 1CPU, 1GB, 5GB | €0.20/day |
-| tiny | 1CPU, 1GB, 40GB | €2.70/mo |
-| small | 2CPU, 2GB, 80GB | €5.10/mo |
-| medium | 4CPU, 4GB, 160GB | €9.90/mo |
-
 ## Project Structure
 
 ```
