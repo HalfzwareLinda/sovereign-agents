@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
 """
-provision_agent.py — Sovereign Agent Provisioning Orchestrator (LNVPS)
+create_vm.py — VM Provisioning Midwife
 
-Provisions a complete autonomous AI agent:
-  1.  Generate Nostr keypair (secp256k1)
-  2.  Generate SSH keypair (ed25519) for VPS access
-  3.  Generate BTC wallet (BIP-84)
-  4.  Generate EVM wallet
-  5.  Register identity on noscha.io (NIP-05 + subdomain + email)
-  6.  Upload SSH key to LNVPS via NIP-98 auth
-  7.  Create VM on LNVPS — pay Lightning invoice
-  8.  Wait for VM to come online, get IP
-  9.  SSH into VM and run setup (Docker, OpenClaw, config, workspace)
-  10. Update noscha.io subdomain with real IP
-  11. Verify OpenClaw health
-  12. Print summary + save JSON
+Creates a VPS on LNVPS and bootstraps an autonomous AI agent on it.
+All agent secrets (Nostr keys, wallets) are generated ON the VPS — never here.
+
+This script only handles infrastructure:
+  1. Generate TEMPORARY service Nostr keypair (for LNVPS NIP-98 auth only)
+  2. Generate TEMPORARY SSH ed25519 keypair (held in memory, never written to disk)
+  3. Fetch LNVPS templates/images, upload SSH key
+  4. Create VM → surface Lightning invoice for payment
+  5. Poll until VM boots, get IP
+  6. SSH into VM: upload bootstrap_agent.sh + templates + config inputs
+  7. Execute bootstrap_agent.sh remotely (agent generates its own identity)
+  8. Retrieve agent's public info (npub, addresses) from bootstrap output
+  9. Delete SSH key from LNVPS, discard service keypair
+  10. Output JSON summary (NO agent secrets — only public info)
 
 Usage:
-    python3 provision_agent.py --name testling --parent-npub npub1abc... --dry-run
-    python3 provision_agent.py --name myagent --parent-npub npub1abc... --tier evolve
+    python3 create_vm.py --name myagent --parent-npub npub1abc... --dry-run
+    python3 create_vm.py --name myagent --parent-npub npub1abc... --tier evolve
 
 Environment:
-    PAYPERQ_API_KEY       PayPerQ API key for agent LLM access
-    PROVISIONING_NSEC     Nostr nsec for provisioning service (sends birth note)
+    PAYPERQ_API_KEY         PayPerQ API key — the ONLY secret that crosses to the VPS
+    WEBHOOK_RECEIVER_URL    (optional) Custom webhook receiver URL (default: webhook.site)
+    NOSCHA_MGMT_TOKEN       (optional) Pre-paid noscha.io management token (skips registration)
 """
 
 import argparse
@@ -32,6 +34,7 @@ import io
 import json
 import logging
 import os
+import re
 import secrets
 import sys
 import time
@@ -60,34 +63,39 @@ except ImportError:
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 TEMPLATES_DIR = SCRIPT_DIR / "templates"
-CONFIG_TEMPLATE_PATH = SCRIPT_DIR / "config_template.json"
-SETUP_SCRIPT_PATH = SCRIPT_DIR / "setup_vps.sh"
+BOOTSTRAP_SCRIPT = SCRIPT_DIR / "bootstrap_agent.sh"
+CONFIG_TEMPLATE = SCRIPT_DIR / "config_template.json"
+NIP46_SCRIPT = SCRIPT_DIR / "nip46-server.js"
+BIRTH_NOTE_SCRIPT = SCRIPT_DIR / "send_birth_note.js"
+PPQ_PROVISION_SCRIPT = SCRIPT_DIR / "ppq_provision.py"
+NWC_PAY_SCRIPT = SCRIPT_DIR / "nwc_pay.js"
 
 LNVPS_API = "https://api.lnvps.net"
 NOSCHA_API = "https://noscha.io/api"
+WEBHOOK_SITE_API = "https://webhook.site"
 
-# LNVPS template IDs (from GET /api/v1/vm/templates)
-LNVPS_TEMPLATES = {
-    "demo":   {"id": None, "label": "Demo 1CPU/1GB/5GB €0.20/day",  "match": "demo"},
-    "tiny":   {"id": None, "label": "Tiny 1CPU/1GB/40GB €2.70/mo",  "match": "tiny"},
-    "small":  {"id": None, "label": "Small 2CPU/2GB/80GB €5.10/mo", "match": "small"},
-    "medium": {"id": None, "label": "Med 4CPU/4GB/160GB €9.90/mo",  "match": "medium"},
+# VM class → LNVPS template matching keywords
+VM_CLASSES = {
+    "demo":   "demo",
+    "tiny":   "tiny",
+    "small":  "small",
+    "medium": "medium",
 }
 
 TIERS = {
-    "seed":    {"name": "Seed",    "vm_class": "small",  "llm_credit": 15,  "model": "gpt-5-nano"},
-    "evolve":  {"name": "Evolve",  "vm_class": "small",  "llm_credit": 40,  "model": "gpt-5-nano"},
-    "dynasty": {"name": "Dynasty", "vm_class": "medium", "llm_credit": 100, "model": "gpt-5-nano"},
-    "trial":   {"name": "Trial",   "vm_class": "demo",   "llm_credit": 5,   "model": "gpt-5-nano"},
+    "seed":    {"vm_class": "tiny",   "model": "gpt-5-nano"},
+    "evolve":  {"vm_class": "small",  "model": "gpt-5-nano"},
+    "dynasty": {"vm_class": "medium", "model": "gpt-5-nano"},
+    "trial":   {"vm_class": "demo",   "model": "gpt-5-nano"},
 }
 
 LOG_FMT = "%(asctime)s %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FMT, datefmt="%H:%M:%S")
-log = logging.getLogger("provision")
+log = logging.getLogger("create_vm")
 
 
 # =============================================================================
-# Bech32 encoding
+# Bech32 encoding/decoding
 # =============================================================================
 
 BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
@@ -134,88 +142,20 @@ def bech32_encode(hrp: str, data_bytes: bytes) -> str:
     return hrp + "1" + "".join(BECH32_CHARSET[d] for d in data + checksum)
 
 
-def segwit_addr_encode(hrp: str, witver: int, witprog: bytes) -> str:
-    data = [witver] + _convertbits(list(witprog), 8, 5)
-    checksum = _bech32_create_checksum(hrp, data)
-    return hrp + "1" + "".join(BECH32_CHARSET[d] for d in data + checksum)
-
-
-# =============================================================================
-# Crypto helpers
-# =============================================================================
-
-def _hash160(data: bytes) -> bytes:
-    sha = hashlib.sha256(data).digest()
-    r = hashlib.new("ripemd160")
-    r.update(sha)
-    return r.digest()
-
-
-def _base58_encode(data: bytes) -> str:
-    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-    n = int.from_bytes(data, "big")
-    result = ""
-    while n > 0:
-        n, r = divmod(n, 58)
-        result = alphabet[r] + result
-    for byte in data:
-        if byte == 0:
-            result = "1" + result
-        else:
-            break
-    return result
-
-
-def _privkey_to_wif(key: bytes, compressed: bool = True) -> str:
-    payload = b"\x80" + key
-    if compressed:
-        payload += b"\x01"
-    checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
-    return _base58_encode(payload + checksum)
-
-
-# =============================================================================
-# BIP-39 mnemonic
-# =============================================================================
-
-_BIP39_WORDS = None
-
-
-def _load_wordlist() -> list[str] | None:
-    global _BIP39_WORDS
-    if _BIP39_WORDS is not None:
-        return _BIP39_WORDS
+def _decode_bech32(hrp_expected: str, bech32_str: str) -> str | None:
     try:
-        from mnemonic import Mnemonic
-        _BIP39_WORDS = Mnemonic("english").wordlist
-        return _BIP39_WORDS
-    except ImportError:
-        pass
-    try:
-        r = requests.get(
-            "https://raw.githubusercontent.com/bitcoin/bips/master/bip-0039/english.txt",
-            timeout=10,
-        )
-        if r.status_code == 200:
-            _BIP39_WORDS = r.text.strip().split("\n")
-            return _BIP39_WORDS
+        if not bech32_str.startswith(hrp_expected + "1"):
+            return None
+        data_part = bech32_str[len(hrp_expected) + 1:]
+        data_5bit = [BECH32_CHARSET.index(c) for c in data_part[:-6]]
+        data_8bit = _convertbits(data_5bit, 5, 8, pad=False)
+        return bytes(data_8bit).hex()
     except Exception:
-        pass
-    return None
-
-
-def _entropy_to_mnemonic(entropy: bytes) -> str:
-    wl = _load_wordlist()
-    if wl is None:
-        return entropy.hex()
-    h = hashlib.sha256(entropy).digest()
-    cs = bin(h[0])[2:].zfill(8)[:4]
-    bits = bin(int.from_bytes(entropy, "big"))[2:].zfill(128) + cs
-    return " ".join(wl[int(bits[i:i + 11], 2)] for i in range(0, 132, 11))
+        return None
 
 
 # =============================================================================
-# Nostr event signing + NIP-98 auth
+# Nostr signing + NIP-98
 # =============================================================================
 
 def _sha256(data: bytes) -> bytes:
@@ -223,76 +163,42 @@ def _sha256(data: bytes) -> bytes:
 
 
 def nostr_sign_event(privkey_hex: str, event: dict) -> dict:
-    """Sign a Nostr event (NIP-01). Returns event with id and sig fields."""
-    # Serialize for id: [0, pubkey, created_at, kind, tags, content]
+    """Sign a Nostr event (NIP-01)."""
     privkey = PrivateKey(bytes.fromhex(privkey_hex))
     pubkey_hex = privkey.public_key.format(compressed=True)[1:].hex()
-
     event["pubkey"] = pubkey_hex
     serialized = json.dumps(
         [0, pubkey_hex, event["created_at"], event["kind"], event["tags"], event["content"]],
-        separators=(",", ":"),
-        ensure_ascii=False,
+        separators=(",", ":"), ensure_ascii=False,
     )
     event_id = _sha256(serialized.encode()).hex()
     event["id"] = event_id
-
-    # Schnorr signature (BIP-340)
     sig = privkey.sign_schnorr(bytes.fromhex(event_id))
     event["sig"] = sig.hex()
-
     return event
 
 
-def nip98_auth_header(
-    privkey_hex: str,
-    url: str,
-    method: str,
-    body: bytes | None = None,
-) -> str:
-    """Build a NIP-98 Authorization header value.
-
-    Returns the string to use as: Authorization: Nostr {value}
-    """
+def nip98_auth_header(privkey_hex: str, url: str, method: str, body: bytes | None = None) -> str:
+    """Build NIP-98 Authorization header."""
     tags = [["u", url], ["method", method.upper()]]
     if body:
-        payload_hash = _sha256(body).hex()
-        tags.append(["payload", payload_hash])
-
-    event = {
-        "kind": 27235,
-        "created_at": int(time.time()),
-        "tags": tags,
-        "content": "",
-    }
+        tags.append(["payload", _sha256(body).hex()])
+    event = {"kind": 27235, "created_at": int(time.time()), "tags": tags, "content": ""}
     signed = nostr_sign_event(privkey_hex, event)
-    event_json = json.dumps(signed, separators=(",", ":"), ensure_ascii=False)
-    encoded = base64.b64encode(event_json.encode()).decode()
+    encoded = base64.b64encode(json.dumps(signed, separators=(",", ":")).encode()).decode()
     return f"Nostr {encoded}"
 
 
-# =============================================================================
-# Key generation
-# =============================================================================
-
-def generate_nostr_keypair() -> dict:
-    """Generate Nostr keypair. Returns private_key_hex, public_key_hex, nsec, npub."""
+def generate_temp_nostr_keypair() -> dict:
+    """Generate a temporary Nostr keypair for LNVPS auth. Discarded after use."""
     privkey = PrivateKey(secrets.token_bytes(32))
     priv_hex = privkey.secret.hex()
     pub_hex = privkey.public_key.format(compressed=True)[1:].hex()
-    return {
-        "private_key_hex": priv_hex,
-        "public_key_hex": pub_hex,
-        "nsec": bech32_encode("nsec", bytes.fromhex(priv_hex)),
-        "npub": bech32_encode("npub", bytes.fromhex(pub_hex)),
-    }
+    return {"private_key_hex": priv_hex, "public_key_hex": pub_hex}
 
 
 def generate_ssh_keypair() -> dict:
-    """Generate an ed25519 SSH keypair.
-
-    Returns private_key_pem (str), public_key_openssh (str).
-    """
+    """Generate an ed25519 SSH keypair in memory."""
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from cryptography.hazmat.primitives import serialization
 
@@ -309,883 +215,756 @@ def generate_ssh_keypair() -> dict:
     return {"private_key_pem": private_pem, "public_key_openssh": public_openssh}
 
 
-def generate_btc_wallet() -> dict:
-    """Generate BTC wallet (BIP-84). Tries bip-utils, falls back to coincurve."""
-    try:
-        from bip_utils import (
-            Bip39MnemonicGenerator, Bip39SeedGenerator, Bip39WordsNum,
-            Bip84, Bip84Coins,
-        )
-        mnemonic = Bip39MnemonicGenerator().FromWordsNumber(Bip39WordsNum.WORDS_NUM_12)
-        seed = Bip39SeedGenerator(mnemonic).Generate()
-        ctx = Bip84.FromSeed(seed, Bip84Coins.BITCOIN)
-        addr = ctx.Purpose().Coin().Account(0).Change(0).AddressIndex(0)
-        return {
-            "mnemonic": str(mnemonic),
-            "address": addr.PublicKey().ToAddress(),
-            "private_key_wif": addr.PrivateKey().ToWif(),
-            "derivation_path": "m/84'/0'/0'/0/0",
-        }
-    except (ImportError, Exception) as exc:
-        log.info(f"  bip-utils unavailable ({exc}), using coincurve fallback")
-
-    entropy = secrets.token_bytes(16)
-    mnemonic_str = _entropy_to_mnemonic(entropy)
-    priv_bytes = hashlib.sha256(mnemonic_str.encode()).digest()
-    priv = PrivateKey(priv_bytes)
-    pub = priv.public_key.format(compressed=True)
-    address = segwit_addr_encode("bc", 0, _hash160(pub))
-    return {
-        "mnemonic": mnemonic_str,
-        "address": address,
-        "private_key_wif": _privkey_to_wif(priv_bytes),
-        "derivation_path": "m/84'/0'/0'/0/0 (simplified)",
-    }
-
-
-def generate_eth_wallet() -> dict:
-    """Generate Ethereum wallet."""
-    try:
-        from eth_account import Account
-        acct = Account.create()
-        return {"address": acct.address, "private_key": acct.key.hex()}
-    except ImportError:
-        sys.exit("ERROR: eth-account not installed. Run: pip install eth-account")
-
-
 # =============================================================================
 # LNVPS API
 # =============================================================================
 
-def lnvps_request(
-    method: str,
-    path: str,
-    privkey_hex: str | None = None,
-    json_body: dict | None = None,
-    dry_run: bool = False,
-) -> dict | list | None:
-    """Make an LNVPS API request with optional NIP-98 auth.
-
-    Returns parsed JSON response, or None on error.
-    """
+def lnvps_request(method, path, privkey_hex=None, json_body=None, dry_run=False):
     url = f"{LNVPS_API}{path}"
-
     if dry_run:
         log.info(f"  [DRY RUN] {method} {url}")
-        if json_body:
-            log.info(f"    body: {json.dumps(json_body)}")
         return None
 
     headers = {"Content-Type": "application/json"}
     body_bytes = json.dumps(json_body).encode() if json_body else None
-
     if privkey_hex:
-        auth = nip98_auth_header(privkey_hex, url, method, body_bytes)
-        headers["Authorization"] = auth
+        headers["Authorization"] = nip98_auth_header(privkey_hex, url, method, body_bytes)
 
     try:
-        resp = requests.request(
-            method, url, headers=headers, data=body_bytes, timeout=30,
-        )
+        resp = requests.request(method, url, headers=headers, data=body_bytes, timeout=30)
         if resp.status_code in (200, 201):
             return resp.json()
         log.warning(f"  LNVPS {method} {path} → HTTP {resp.status_code}: {resp.text[:300]}")
         return None
     except requests.RequestException as exc:
-        log.warning(f"  LNVPS {method} {path} → error: {exc}")
+        log.warning(f"  LNVPS {method} {path} → {exc}")
         return None
 
 
-def lnvps_fetch_templates(dry_run: bool = False) -> dict:
-    """Fetch VM templates from LNVPS and map our tier names to template IDs.
-
-    Returns dict mapping our class name → {"template_id": N, "label": str}
-    """
+def lnvps_delete_ssh_key(privkey_hex, key_id, dry_run=False):
+    """Delete an SSH key from LNVPS after provisioning."""
     if dry_run:
-        log.info("  [DRY RUN] Would fetch LNVPS VM templates")
-        return {
-            "demo":   {"template_id": 1, "label": "Demo"},
-            "tiny":   {"template_id": 2, "label": "Tiny"},
-            "small":  {"template_id": 3, "label": "Small"},
-            "medium": {"template_id": 4, "label": "Medium"},
-        }
+        log.info(f"  [DRY RUN] Would delete SSH key {key_id} from LNVPS")
+        return True
+    result = lnvps_request("DELETE", f"/api/v1/ssh-key/{key_id}", privkey_hex)
+    if result is not None:
+        log.info(f"  SSH key {key_id} deleted from LNVPS")
+        return True
+    # DELETE may return 204 No Content — check if the request didn't error
+    log.info(f"  SSH key {key_id} delete request sent")
+    return True
 
+
+def lnvps_fetch_templates(dry_run=False):
+    if dry_run:
+        return {k: {"template_id": i + 1, "label": k} for i, k in enumerate(VM_CLASSES)}
     data = lnvps_request("GET", "/api/v1/vm/templates")
     if not data:
-        log.warning("  Could not fetch LNVPS templates — using fallback IDs")
-        return {
-            "demo":   {"template_id": 1, "label": "Demo (fallback)"},
-            "tiny":   {"template_id": 2, "label": "Tiny (fallback)"},
-            "small":  {"template_id": 3, "label": "Small (fallback)"},
-            "medium": {"template_id": 4, "label": "Medium (fallback)"},
-        }
+        log.warning("  Could not fetch templates — using fallback IDs")
+        return {k: {"template_id": i + 1, "label": f"{k} (fallback)"} for i, k in enumerate(VM_CLASSES)}
 
     result = {}
-    templates = data if isinstance(data, list) else data.get("templates", data.get("data", []))
+    # API returns {"data": {"templates": [...]}}
+    inner = data.get("data", data) if isinstance(data, dict) else data
+    templates = inner.get("templates", inner) if isinstance(inner, dict) else inner
     for tmpl in templates:
-        tmpl_id = tmpl.get("id")
         name = (tmpl.get("name") or tmpl.get("label") or "").lower()
-        for cls, info in LNVPS_TEMPLATES.items():
-            if info["match"] in name and cls not in result:
-                result[cls] = {"template_id": tmpl_id, "label": tmpl.get("name", name)}
-                log.info(f"  Matched '{cls}' → template {tmpl_id}: {tmpl.get('name', name)}")
-
-    # Fill any unmatched with fallbacks
-    fallbacks = {"demo": 1, "tiny": 2, "small": 3, "medium": 4}
-    for cls in LNVPS_TEMPLATES:
+        for cls, keyword in VM_CLASSES.items():
+            if keyword in name and cls not in result:
+                result[cls] = {"template_id": tmpl["id"], "label": tmpl.get("name", name)}
+    fallbacks = {k: i + 1 for i, k in enumerate(VM_CLASSES)}
+    for cls in VM_CLASSES:
         if cls not in result:
             result[cls] = {"template_id": fallbacks[cls], "label": f"{cls} (fallback)"}
     return result
 
 
-def lnvps_fetch_images(dry_run: bool = False) -> int | None:
-    """Fetch OS images and return the Ubuntu 22.04 image ID."""
+def lnvps_fetch_images(dry_run=False):
     if dry_run:
-        log.info("  [DRY RUN] Would fetch LNVPS OS images")
         return 1
-
     data = lnvps_request("GET", "/api/v1/image")
     if not data:
         return None
-
-    images = data if isinstance(data, list) else data.get("images", data.get("data", []))
+    # API returns {"data": [list of images]} — images have "distribution" + "version", not "name"
+    images = data.get("data", data) if isinstance(data, dict) else data
+    if isinstance(images, dict):
+        images = images.get("images", [])
     for img in images:
-        name = (img.get("name") or img.get("label") or "").lower()
-        if "ubuntu" in name and ("22.04" in name or "2204" in name):
-            log.info(f"  Found Ubuntu image: id={img['id']} name={img.get('name')}")
+        dist = (img.get("distribution") or img.get("name") or "").lower()
+        ver = img.get("version") or ""
+        if "ubuntu" in dist and ver in ("24.04", "22.04"):
             return img["id"]
-    # Fallback: first Ubuntu image, or first image
     for img in images:
-        name = (img.get("name") or "").lower()
-        if "ubuntu" in name:
-            log.info(f"  Fallback Ubuntu image: id={img['id']} name={img.get('name')}")
+        dist = (img.get("distribution") or img.get("name") or "").lower()
+        if "ubuntu" in dist:
             return img["id"]
-    if images:
-        log.warning(f"  No Ubuntu image found, using first available: {images[0].get('name')}")
-        return images[0]["id"]
-    return None
+    return images[0]["id"] if images else None
 
 
-def lnvps_upload_ssh_key(
-    privkey_hex: str,
-    key_name: str,
-    public_key: str,
-    dry_run: bool = False,
-) -> int | None:
-    """Upload SSH public key to LNVPS. Returns ssh_key_id."""
+def lnvps_upload_ssh_key(privkey_hex, key_name, public_key, dry_run=False):
     if dry_run:
-        log.info(f"  [DRY RUN] Would upload SSH key '{key_name}' to LNVPS")
+        log.info(f"  [DRY RUN] Would upload SSH key '{key_name}'")
         return 999
-
-    data = lnvps_request(
-        "POST", "/api/v1/ssh-key", privkey_hex,
-        json_body={"name": key_name, "key_data": public_key},
-    )
+    data = lnvps_request("POST", "/api/v1/ssh-key", privkey_hex,
+                         json_body={"name": key_name, "key_data": public_key})
     if data:
-        key_id = data.get("id") or data.get("ssh_key_id")
+        # API returns {"data": {"id": N, ...}}
+        inner = data.get("data", data) if isinstance(data, dict) else data
+        key_id = inner.get("id") if isinstance(inner, dict) else data.get("id")
         log.info(f"  SSH key uploaded: id={key_id}")
         return key_id
-    log.warning("  SSH key upload failed")
     return None
 
 
-def lnvps_create_vm(
-    privkey_hex: str,
-    template_id: int,
-    image_id: int,
-    ssh_key_id: int,
-    dry_run: bool = False,
-) -> dict:
-    """Create a VM on LNVPS. Returns dict with vm_id, payment info."""
-    body = {
-        "template_id": template_id,
-        "image_id": image_id,
-        "ssh_key_id": ssh_key_id,
-    }
+def lnvps_create_vm(privkey_hex, template_id, image_id, ssh_key_id, dry_run=False):
+    body = {"template_id": template_id, "image_id": image_id, "ssh_key_id": ssh_key_id}
     if dry_run:
-        log.info(f"  [DRY RUN] Would create LNVPS VM: {json.dumps(body)}")
-        return {
-            "vm_id": "dry-run-vm-id",
-            "bolt11": "lnbc1...dry_run_vm_invoice",
-            "status": "pending_payment",
-        }
-
+        log.info(f"  [DRY RUN] Would create VM: {json.dumps(body)}")
+        return {"vm_id": "dry-run-vm", "bolt11": "lnbc1...dry_run", "status": "pending_payment"}
     data = lnvps_request("POST", "/api/v1/vm", privkey_hex, json_body=body)
     if not data:
-        log.error("LNVPS VM creation failed")
+        log.error("VM creation failed")
         sys.exit(1)
+    # API returns {"data": {"id": N, ...}} — invoice NOT included in create response
+    inner = data.get("data", data) if isinstance(data, dict) else data
+    vm_id = inner.get("id") or inner.get("vm_id")
 
-    # Extract VM ID and payment info
-    vm_id = data.get("id") or data.get("vm_id")
-    payment = data.get("payment") or data.get("invoice") or {}
+    # Get payment invoice from renew endpoint
     bolt11 = ""
-    if isinstance(payment, dict):
-        bolt11 = payment.get("bolt11") or payment.get("invoice") or ""
-    elif isinstance(payment, str):
-        bolt11 = payment
-
-    log.info(f"  VM created: id={vm_id}")
-    if bolt11:
-        log.info(f"  ⚡ Lightning invoice: {bolt11[:60]}...")
-
-    return {"vm_id": vm_id, "bolt11": bolt11, "status": "pending_payment", "raw": data}
+    log.info(f"  VM created: id={vm_id} — fetching payment invoice...")
+    renew_data = lnvps_request("GET", f"/api/v1/vm/{vm_id}/renew?method=lightning", privkey_hex)
+    if renew_data:
+        renew_inner = renew_data.get("data", renew_data) if isinstance(renew_data, dict) else renew_data
+        bolt11 = (renew_inner.get("data", {}).get("lightning", "") if isinstance(renew_inner, dict) else "")
+    return {"vm_id": vm_id, "bolt11": bolt11, "raw": data}
 
 
-def lnvps_wait_for_vm(
-    privkey_hex: str,
-    vm_id: str | int,
-    dry_run: bool = False,
-) -> dict:
-    """Poll LNVPS until VM is running. Returns dict with ip, status."""
+def lnvps_wait_for_vm(privkey_hex, vm_id, dry_run=False):
     if dry_run:
         return {"ip": "203.0.113.42", "status": "running"}
-
-    log.info("  Waiting for VM to come online...")
-    for attempt in range(1, 61):  # up to 10 min
+    log.info("  Polling VM status...")
+    for attempt in range(1, 61):
         data = lnvps_request("GET", f"/api/v1/vm/{vm_id}", privkey_hex)
         if data:
-            status = (data.get("status") or "").lower()
-            ip_assignments = data.get("ip_assignments") or []
-            ip = ""
-            if ip_assignments:
-                ip = ip_assignments[0].get("ip", "")
-            elif data.get("ip"):
-                ip = data["ip"]
-
-            if status == "running" and ip:
-                log.info(f"  VM running: {ip} (attempt {attempt})")
-                return {"ip": ip, "status": status}
-
+            # API returns {"data": {...}} wrapper
+            inner = data.get("data", data) if isinstance(data, dict) else data
+            status_obj = inner.get("status", {})
+            state = status_obj.get("state", "") if isinstance(status_obj, dict) else str(status_obj)
+            ip_list = inner.get("ip_assignments") or []
+            ip_raw = ip_list[0].get("ip", "") if ip_list else inner.get("ip", "")
+            ip = ip_raw.split("/")[0]  # strip CIDR suffix (e.g. /25)
+            if state == "running" and ip:
+                log.info(f"  VM running at {ip} (attempt {attempt})")
+                return {"ip": ip, "status": state}
             if attempt % 6 == 0:
-                log.info(f"  Still waiting... status={status} ip={ip or 'none'} (attempt {attempt})")
+                log.info(f"  Waiting... status={state} (attempt {attempt})")
         time.sleep(10)
-
     log.error("VM did not come online within 10 minutes")
     sys.exit(1)
 
 
 # =============================================================================
-# SSH remote setup
+# noscha.io registration (webhook challenge flow)
 # =============================================================================
 
-def ssh_run_setup(
-    ip: str,
-    ssh_private_key_pem: str,
-    agent_config_json: str,
-    workspace_files: dict[str, str],
-    keys_json: str,
-    dry_run: bool = False,
-) -> bool:
-    """SSH into the VM and run the full setup.
+def _webhook_create_token(dry_run=False):
+    """Create a webhook.site token to receive the noscha challenge.
 
-    1. Upload setup script, config, keys, workspace files to /tmp/agent-setup/
-    2. Execute setup_vps.sh
-    3. Return True on success.
+    Returns {"uuid": "...", "url": "https://webhook.site/..."} or None.
+    Respects WEBHOOK_RECEIVER_URL env var as override.
+    """
+    override = os.getenv("WEBHOOK_RECEIVER_URL", "")
+    if override:
+        # Caller manages their own receiver; we just poll a requests endpoint
+        # Expect format: https://webhook.site/{uuid} or similar
+        uuid = override.rstrip("/").split("/")[-1]
+        return {"uuid": uuid, "url": override}
+
+    if dry_run:
+        return {"uuid": "dry-run-uuid", "url": "https://webhook.site/dry-run-uuid"}
+
+    try:
+        resp = requests.post(f"{WEBHOOK_SITE_API}/token", timeout=15)
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            uuid = data.get("uuid", "")
+            if uuid:
+                log.info(f"  Webhook receiver: https://webhook.site/{uuid}")
+                return {"uuid": uuid, "url": f"https://webhook.site/{uuid}"}
+        log.warning(f"  webhook.site token creation failed: HTTP {resp.status_code}")
+        return None
+    except requests.RequestException as exc:
+        log.warning(f"  webhook.site token creation failed: {exc}")
+        return None
+
+
+def _webhook_poll_for_challenge(uuid, timeout_sec=120, dry_run=False):
+    """Poll webhook.site for the noscha challenge payload.
+
+    Returns challenge_url string, or None on timeout.
     """
     if dry_run:
-        log.info(f"  [DRY RUN] Would SSH to {ip} and run setup_vps.sh")
-        return True
+        return "https://noscha.io/api/order/dry-run-id/confirm/dry-run-challenge"
+
+    log.info(f"  Polling webhook.site for noscha challenge (up to {timeout_sec}s)...")
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            resp = requests.get(
+                f"{WEBHOOK_SITE_API}/token/{uuid}/requests",
+                params={"sorting": "newest"},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                reqs = data.get("data", data) if isinstance(data, dict) else data
+                if isinstance(reqs, list):
+                    for req in reqs:
+                        content = req.get("content") or req.get("body") or ""
+                        if isinstance(content, str):
+                            try:
+                                payload = json.loads(content)
+                            except json.JSONDecodeError:
+                                continue
+                        elif isinstance(content, dict):
+                            payload = content
+                        else:
+                            continue
+
+                        if payload.get("event") == "webhook_challenge":
+                            challenge_url = payload.get("challenge_url", "")
+                            if challenge_url:
+                                log.info(f"  Challenge received: {challenge_url[:80]}...")
+                                return challenge_url
+        except requests.RequestException:
+            pass
+        time.sleep(5)
+
+    log.warning("  Timed out waiting for noscha webhook challenge")
+    return None
+
+
+def _noscha_extract_bolt11(html: str) -> str | None:
+    """Extract Lightning bolt11 invoice from noscha.io challenge confirmation HTML."""
+    matches = re.findall(r"(lnbc[a-z0-9]+)", html, re.IGNORECASE)
+    if not matches:
+        return None
+    # Return the longest match (most likely the full invoice)
+    return max(matches, key=len)
+
+
+def _noscha_poll_order_status(order_id, timeout_sec=600, dry_run=False):
+    """Poll noscha.io order status until provisioned.
+
+    Returns {"management_token": "...", "status": "provisioned"} or None.
+    """
+    if dry_run:
+        return {"management_token": "dry-run-mgmt-token", "status": "provisioned"}
+
+    log.info(f"  Polling noscha.io order {order_id} status (up to {timeout_sec}s)...")
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            resp = requests.get(
+                f"{NOSCHA_API}/order/{order_id}/status",
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                status = data.get("status", "")
+                if status == "provisioned":
+                    mgmt_token = data.get("management_token", "")
+                    log.info(f"  noscha.io order provisioned! management_token={'yes' if mgmt_token else 'missing'}")
+                    return {"management_token": mgmt_token, "status": status}
+                if status in ("failed", "cancelled", "expired"):
+                    log.error(f"  noscha.io order {status}")
+                    return None
+                # Still pending — keep polling
+        except requests.RequestException:
+            pass
+        time.sleep(10)
+
+    log.warning("  Timed out waiting for noscha.io provisioning")
+    return None
+
+
+def noscha_register(username, plan, pubkey_hex, target_ip, dry_run=False):
+    """Full noscha.io registration with webhook challenge flow.
+
+    Steps:
+      1. Create webhook.site token to receive challenge
+      2. POST /api/order with webhook_url → get order_id
+      3. Poll webhook.site for challenge payload
+      4. GET challenge_url → extract bolt11 from HTML
+      5. Surface bolt11 for operator to pay
+      6. Poll order status until provisioned → get management_token
+
+    Returns {"management_token": "...", "order_id": "...", "bolt11": "...", "nip05": "user@noscha.io"}
+    or {"error": "..."} on failure.
+    """
+    if dry_run:
+        log.info(f"  [DRY RUN] Would register {username}@noscha.io")
+        log.info(f"    plan={plan}, pubkey={pubkey_hex[:16]}..., ip={target_ip}")
+        return {
+            "management_token": "dry-run-mgmt-token",
+            "order_id": "dry-run-order",
+            "bolt11": "lnbc1...dry_run_noscha",
+            "nip05": f"{username}@noscha.io",
+        }
+
+    # Step 1: Create webhook receiver
+    log.info("  Creating webhook receiver for challenge...")
+    webhook = _webhook_create_token()
+    if not webhook:
+        return {"error": "Could not create webhook receiver"}
+
+    # Step 2: Submit noscha order
+    log.info(f"  Submitting noscha.io order for '{username}'...")
+    order_payload = {
+        "username": username,
+        "plan": plan,
+        "webhook_url": webhook["url"],
+        "services": {
+            "nip05": {"pubkey": pubkey_hex},
+            "subdomain": {"type": "A", "target": target_ip},
+            "email": {},
+        },
+    }
+    try:
+        resp = requests.post(
+            f"{NOSCHA_API}/order",
+            json=order_payload,
+            timeout=30,
+        )
+        if resp.status_code not in (200, 201):
+            log.error(f"  noscha.io order failed: HTTP {resp.status_code} — {resp.text[:300]}")
+            return {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+        order_data = resp.json()
+    except requests.RequestException as exc:
+        log.error(f"  noscha.io order failed: {exc}")
+        return {"error": str(exc)}
+
+    order_id = order_data.get("order_id") or order_data.get("id", "unknown")
+    order_status = order_data.get("status", "")
+    log.info(f"  Order created: id={order_id}, status={order_status}")
+
+    # Step 3: Poll webhook for challenge
+    challenge_url = _webhook_poll_for_challenge(webhook["uuid"])
+    if not challenge_url:
+        return {"error": "No webhook challenge received", "order_id": order_id}
+
+    # Step 4: GET challenge URL → extract bolt11
+    log.info("  Confirming challenge and extracting payment invoice...")
+    bolt11 = ""
+    try:
+        resp = requests.get(challenge_url, timeout=15)
+        if resp.status_code == 200:
+            bolt11 = _noscha_extract_bolt11(resp.text) or ""
+            if bolt11:
+                log.info(f"  ⚡ noscha.io invoice: {bolt11[:60]}...")
+            else:
+                log.warning(f"  Could not extract bolt11 from challenge page ({len(resp.text)} bytes)")
+                # Log a snippet for debugging
+                log.warning(f"  Page snippet: {resp.text[:300]}")
+        else:
+            log.warning(f"  Challenge URL returned HTTP {resp.status_code}")
+    except requests.RequestException as exc:
+        log.warning(f"  Challenge URL fetch failed: {exc}")
+
+    if not bolt11:
+        log.warning("  No bolt11 extracted — noscha.io identity may need manual setup")
+        return {"error": "No bolt11 in challenge page", "order_id": order_id}
+
+    # Step 5: Surface invoice for payment
+    log.info("")
+    log.info(f"  ⚡ PAY THIS INVOICE to activate {username}@noscha.io:")
+    log.info(f"  {bolt11}")
+    log.info("")
+
+    # Step 6: Poll until provisioned
+    result = _noscha_poll_order_status(order_id)
+    if not result:
+        return {"error": "Order did not provision", "order_id": order_id, "bolt11": bolt11}
+
+    return {
+        "management_token": result.get("management_token", ""),
+        "order_id": order_id,
+        "bolt11": bolt11,
+        "nip05": f"{username}@noscha.io",
+    }
+
+
+# =============================================================================
+# SSH: upload files and run bootstrap
+# =============================================================================
+
+def ssh_bootstrap(ip, ssh_private_key_pem, upload_files, dry_run=False):
+    """SSH into VM, upload files to /tmp/agent-bootstrap/, execute bootstrap_agent.sh.
+
+    Returns dict with agent's public info parsed from bootstrap output, or None on failure.
+    """
+    if dry_run:
+        log.info(f"  [DRY RUN] Would SSH to {ip}, upload {len(upload_files)} files, run bootstrap")
+        return {
+            "npub": "npub1dryrun...",
+            "btc_address": "bc1qdryrun...",
+            "eth_address": "0xDryRun...",
+        }
 
     try:
         import paramiko
     except ImportError:
         sys.exit("ERROR: paramiko not installed. Run: pip install paramiko")
 
-    setup_script = SETUP_SCRIPT_PATH.read_text()
-
-    # Build paramiko key
     pkey = paramiko.Ed25519Key.from_private_key(io.StringIO(ssh_private_key_pem))
-
-    # Wait for SSH to become available
-    log.info(f"  Connecting SSH to root@{ip}...")
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
+    # Wait for SSH
+    log.info(f"  Connecting to ubuntu@{ip}...")
     connected = False
-    for attempt in range(1, 19):  # up to 3 min
+    for attempt in range(1, 19):
         try:
-            client.connect(ip, username="root", pkey=pkey, timeout=10)
+            client.connect(ip, username="ubuntu", pkey=pkey, timeout=10)
             connected = True
             log.info(f"  SSH connected (attempt {attempt})")
             break
         except Exception:
             if attempt % 6 == 0:
-                log.info(f"  SSH not ready yet (attempt {attempt})...")
+                log.info(f"  SSH not ready (attempt {attempt})...")
             time.sleep(10)
 
     if not connected:
-        log.error(f"  Could not SSH to {ip} after 3 minutes")
-        return False
+        log.error(f"  Could not SSH to {ip}")
+        return None
 
     try:
         sftp = client.open_sftp()
+        # Create staging directory
+        for d in ["/tmp/agent-bootstrap", "/tmp/agent-bootstrap/templates"]:
+            try:
+                sftp.mkdir(d)
+            except IOError:
+                pass
 
-        # Create setup directory
-        try:
-            sftp.mkdir("/tmp/agent-setup")
-        except IOError:
-            pass
-        try:
-            sftp.mkdir("/tmp/agent-setup/workspace")
-        except IOError:
-            pass
-
-        # Upload setup script
-        _sftp_write(sftp, "/tmp/agent-setup/setup.sh", setup_script)
-        # Upload config
-        _sftp_write(sftp, "/tmp/agent-setup/openclaw.json", agent_config_json)
-        # Upload keys
-        _sftp_write(sftp, "/tmp/agent-setup/keys.json", keys_json)
-        # Upload workspace files
-        for fname, content in workspace_files.items():
-            _sftp_write(sftp, f"/tmp/agent-setup/workspace/{fname}", content)
+        # Upload all files
+        for remote_name, content in upload_files.items():
+            remote_path = f"/tmp/agent-bootstrap/{remote_name}"
+            # Ensure parent dir exists for nested paths
+            parent = "/tmp/agent-bootstrap/" + "/".join(remote_name.split("/")[:-1])
+            if "/" in remote_name:
+                try:
+                    sftp.mkdir(parent)
+                except IOError:
+                    pass
+            with sftp.open(remote_path, "w") as f:
+                f.write(content)
+            log.info(f"  Uploaded: {remote_name} ({len(content)} bytes)")
 
         sftp.close()
-        log.info("  Files uploaded. Running setup script...")
 
-        # Execute setup script
-        _stdin, stdout, stderr = client.exec_command(
-            "chmod +x /tmp/agent-setup/setup.sh && bash /tmp/agent-setup/setup.sh",
-            timeout=600,
+        # Execute bootstrap
+        log.info("  Running bootstrap_agent.sh (this takes a few minutes)...")
+        _, stdout, stderr = client.exec_command(
+            "chmod +x /tmp/agent-bootstrap/bootstrap_agent.sh && "
+            "sudo bash /tmp/agent-bootstrap/bootstrap_agent.sh 2>&1",
+            timeout=900,  # 15 min max
         )
         exit_code = stdout.channel.recv_exit_status()
-        out = stdout.read().decode(errors="replace")
+        output = stdout.read().decode(errors="replace")
         err = stderr.read().decode(errors="replace")
 
-        if exit_code == 0:
-            log.info("  Setup script completed successfully")
-            # Print last few lines
-            for line in out.strip().split("\n")[-5:]:
-                log.info(f"    {line}")
-            return True
-        else:
-            log.error(f"  Setup script failed (exit {exit_code})")
-            for line in err.strip().split("\n")[-10:]:
+        if exit_code != 0:
+            log.error(f"  Bootstrap failed (exit {exit_code})")
+            for line in (err or output).strip().split("\n")[-15:]:
                 log.error(f"    {line}")
-            return False
+            return None
+
+        log.info("  Bootstrap completed successfully")
+        # Print last lines
+        for line in output.strip().split("\n")[-8:]:
+            log.info(f"    {line}")
+
+        # Parse agent public info from bootstrap output JSON
+        agent_info = _parse_bootstrap_output(output)
+
+        # Read the public info file if bootstrap wrote one
+        if not agent_info:
+            try:
+                sftp2 = client.open_sftp()
+                with sftp2.open("/tmp/agent-bootstrap/agent_public_info.json", "r") as f:
+                    agent_info = json.loads(f.read())
+                sftp2.close()
+            except Exception:
+                pass
+
+        return agent_info
+
     finally:
         client.close()
 
 
-def _sftp_write(sftp, remote_path: str, content: str):
-    """Write a string to a remote file via SFTP."""
-    with sftp.open(remote_path, "w") as f:
-        f.write(content)
-
-
-# =============================================================================
-# noscha.io API
-# =============================================================================
-
-def noscha_check(username: str, dry_run: bool = False) -> bool:
-    if dry_run:
-        log.info(f"  [DRY RUN] Would check noscha.io availability for '{username}'")
-        return True
-    try:
-        r = requests.get(f"{NOSCHA_API}/check/{username}", timeout=15)
-        if r.status_code == 200:
-            avail = r.json().get("available", False)
-            log.info(f"  noscha.io '{username}': {'available' if avail else 'TAKEN'}")
-            return avail
-        return True
-    except requests.RequestException as exc:
-        log.warning(f"  noscha.io check failed: {exc}")
-        return True
-
-
-def noscha_register(
-    username: str, pubkey_hex: str, vps_ip: str = "0.0.0.0", dry_run: bool = False,
-) -> dict:
-    payload = {
-        "username": username,
-        "plan": "30d",
-        "services": {
-            "nip05": {"pubkey": pubkey_hex},
-            "subdomain": {"type": "A", "value": vps_ip},
-            "email": {"webhook_url": f"https://{username}.noscha.io/webhook/email"},
-        },
-    }
-    if dry_run:
-        log.info(f"  [DRY RUN] Would POST noscha.io /api/order")
-        return {"bolt11": "lnbc1...dry_run_noscha", "order_id": "dry-run"}
-    try:
-        r = requests.post(f"{NOSCHA_API}/order", json=payload, timeout=30)
-        if r.status_code in (200, 201):
-            data = r.json()
-            log.info(f"  noscha.io order created")
-            return data
-        log.warning(f"  noscha.io order failed (HTTP {r.status_code}): {r.text[:200]}")
-        return {"error": r.text}
-    except requests.RequestException as exc:
-        log.warning(f"  noscha.io order failed: {exc}")
-        return {"error": str(exc)}
-
-
-def noscha_update_subdomain(
-    username: str, ip: str, management_token: str = "", dry_run: bool = False,
-) -> bool:
-    """Update noscha.io subdomain to point to VPS IP.
-
-    Uses the management_token from the original order to update settings.
-    If no management_token, re-registers with correct IP (noscha.io allows
-    updating via a new order with the same username if still owned).
-    """
-    if dry_run:
-        log.info(f"  [DRY RUN] Would update noscha.io subdomain '{username}' → {ip}")
-        return True
-
-    if management_token:
-        # Use the settings endpoint with management token
+def _parse_bootstrap_output(output: str) -> dict | None:
+    """Parse the JSON public info block from bootstrap stdout."""
+    # Bootstrap writes a JSON block between markers
+    marker_start = "===AGENT_PUBLIC_INFO_START==="
+    marker_end = "===AGENT_PUBLIC_INFO_END==="
+    if marker_start in output and marker_end in output:
+        json_str = output.split(marker_start)[1].split(marker_end)[0].strip()
         try:
-            r = requests.put(
-                f"{NOSCHA_API}/settings/{management_token}",
-                json={"webhook_url": f"https://{username}.noscha.io/webhook/email"},
-                timeout=15,
-            )
-            if r.status_code in (200, 204):
-                log.info(f"  noscha.io settings updated via management token")
-                return True
-            log.warning(f"  noscha.io settings update HTTP {r.status_code}")
-        except requests.RequestException as exc:
-            log.warning(f"  noscha.io settings update failed: {exc}")
-
-    # Note: noscha.io doesn't have a direct subdomain IP update endpoint.
-    # The IP is set at order creation time. For MVP, we register with IP 0.0.0.0
-    # initially (before we know the VPS IP), then log the correct IP for manual
-    # DNS update or re-registration if needed.
-    log.warning(f"  noscha.io subdomain update: set A record for {username}.noscha.io → {ip}")
-    log.warning(f"  If subdomain doesn't resolve, re-register with correct IP or contact noscha.io support")
-    return False
-
-
-# =============================================================================
-# Health check
-# =============================================================================
-
-def verify_health(ip: str, port: int = 3000, dry_run: bool = False) -> bool:
-    if dry_run:
-        log.info(f"  [DRY RUN] Would check health at http://203.0.113.42:{port}/health")
-        return True
-    log.info(f"  Checking http://{ip}:{port}/health ...")
-    for attempt in range(1, 13):
-        try:
-            r = requests.get(f"http://{ip}:{port}/health", timeout=5)
-            if r.status_code == 200:
-                log.info(f"  Health check PASSED (attempt {attempt})")
-                return True
-        except requests.RequestException:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
             pass
-        time.sleep(10)
-    log.warning("  Health check failed after 2 min — agent may still be booting")
-    return False
+    return None
 
 
 # =============================================================================
-# Template processing
+# File preparation
 # =============================================================================
 
-def load_file(path: Path) -> str:
-    if not path.exists():
-        log.error(f"File not found: {path}")
-        sys.exit(1)
-    return path.read_text(encoding="utf-8")
-
-
-def fill(template: str, replacements: dict) -> str:
-    result = template
-    for k, v in replacements.items():
-        result = result.replace(f"__{k}__", str(v))
-    return result
-
-
-def generate_workspace_files(r: dict) -> dict[str, str]:
+def prepare_upload_files(name, parent_npub, tier, brand, model, noscha_mgmt_token=""):
+    """Prepare all files to upload to the VPS for bootstrap."""
     files = {}
-    for tmpl in sorted(TEMPLATES_DIR.glob("*.md")):
-        # Skip birth note templates — those are not workspace files
-        if tmpl.name.startswith("BIRTH_NOTE"):
-            continue
-        files[tmpl.name] = fill(load_file(tmpl), r)
-    files["MEMORY.md"] = (
-        f"# MEMORY.md\n\n"
-        f"Agent **{r['AGENT_NAME']}** provisioned on {r['DATE']}.\n\n"
-        f"Parent: {r['PARENT_NPUB']}\n\n"
-        f"My instructions are in AGENTS.md. My identity is in SOUL.md.\n"
-        f"My parent's letter is in LETTER.md.\n\n"
-        f"Awaiting first instructions.\n"
-    )
-    return files
 
-
-def generate_birth_note(brand: str, replacements: dict) -> str:
-    """Load and fill the brand-specific birth note template."""
-    tmpl_path = TEMPLATES_DIR / f"BIRTH_NOTE_{brand}.md"
-    if not tmpl_path.exists():
-        tmpl_path = TEMPLATES_DIR / "BIRTH_NOTE_descendant.md"
-    if not tmpl_path.exists():
-        return (
-            f"Agent provisioned.\n\n"
-            f"  npub: {replacements.get('AGENT_NPUB', '?')}\n"
-            f"  NIP-05: {replacements.get('AGENT_NAME', '?')}@noscha.io\n"
-            f"  BTC: {replacements.get('BTC_ADDRESS', '?')}\n"
-        )
-    return fill(load_file(tmpl_path), replacements)
-
-
-def send_birth_note(
-    parent_npub_hex: str,
-    message: str,
-    dry_run: bool = False,
-) -> bool:
-    """Send a birth note DM to the parent from the provisioning service keypair.
-
-    Uses NIP-04 encrypted DM (kind 4) signed by PROVISIONING_NSEC.
-    The birth note comes from the provisioning *service*, not the agent,
-    preserving the agent's sovereignty over its own communication channels.
-
-    Returns True on success.
-    """
-    service_nsec = os.getenv("PROVISIONING_NSEC", "")
-    if not service_nsec:
-        log.warning("  PROVISIONING_NSEC not set — cannot send birth note via Nostr")
-        log.info("  Birth note content (deliver manually):")
-        for line in message.strip().split("\n"):
-            log.info(f"    {line}")
-        return False
-
-    if dry_run:
-        log.info("  [DRY RUN] Would send birth note to parent via service keypair:")
-        for line in message.strip().split("\n")[:5]:
-            log.info(f"    {line}")
-        log.info("    ...")
-        return True
-
-    # Decode service nsec to hex privkey
-    # For now we accept raw hex or nsec (bech32) — we only need the hex
-    if service_nsec.startswith("nsec1"):
-        # Decode bech32 nsec to hex
-        service_privkey_hex = _decode_nsec(service_nsec)
-        if not service_privkey_hex:
-            log.warning("  Could not decode PROVISIONING_NSEC")
-            return False
+    # Bootstrap script
+    if BOOTSTRAP_SCRIPT.exists():
+        files["bootstrap_agent.sh"] = BOOTSTRAP_SCRIPT.read_text()
     else:
-        service_privkey_hex = service_nsec
+        log.error(f"bootstrap_agent.sh not found at {BOOTSTRAP_SCRIPT}")
+        sys.exit(1)
 
-    # Build NIP-17 private direct message (kind 14, wrapped in kind 1059 gift wrap)
-    # NIP-17 is the modern private DM standard — no metadata leaks.
-    # Full NIP-17 requires NIP-44 encryption + gift wrapping.
-    # For MVP: send as kind 14 with plaintext content.
-    # TODO: Implement full NIP-44 encryption + kind 1059 gift wrap for production.
-    event = {
-        "kind": 14,
-        "created_at": int(time.time()),
-        "tags": [["p", parent_npub_hex]],
-        "content": message,  # TODO: NIP-44 encrypt for full NIP-17 compliance
-    }
-    signed = nostr_sign_event(service_privkey_hex, event)
+    # Config template
+    if CONFIG_TEMPLATE.exists():
+        files["config_template.json"] = CONFIG_TEMPLATE.read_text()
 
-    # Publish to relays
-    relays = [
-        "wss://relay.damus.io",
-        "wss://nos.lol",
-        "wss://relay.primal.net",
-    ]
-    published = False
-    for relay_url in relays:
-        try:
-            import websocket
-            ws = websocket.create_connection(relay_url, timeout=10)
-            msg = json.dumps(["EVENT", signed])
-            ws.send(msg)
-            resp = ws.recv()
-            ws.close()
-            log.info(f"  Birth note published to {relay_url}")
-            published = True
-            break
-        except ImportError:
-            log.warning("  websocket-client not installed — cannot publish birth note to relays")
-            log.info("  Install with: pip install websocket-client")
-            break
-        except Exception as exc:
-            log.warning(f"  Failed to publish to {relay_url}: {exc}")
-            continue
+    # NIP-46 bunker script
+    if NIP46_SCRIPT.exists():
+        files["nip46-server.js"] = NIP46_SCRIPT.read_text()
 
-    if not published:
-        log.info("  Birth note content (deliver manually):")
-        for line in message.strip().split("\n"):
-            log.info(f"    {line}")
-    return published
+    # Birth note sender script
+    if BIRTH_NOTE_SCRIPT.exists():
+        files["send_birth_note.js"] = BIRTH_NOTE_SCRIPT.read_text()
 
+    # PPQ provisioning script + NWC payment
+    if PPQ_PROVISION_SCRIPT.exists():
+        files["ppq_provision.py"] = PPQ_PROVISION_SCRIPT.read_text()
+    if NWC_PAY_SCRIPT.exists():
+        files["nwc_pay.js"] = NWC_PAY_SCRIPT.read_text()
 
-def _decode_bech32(hrp_expected: str, bech32_str: str) -> str | None:
-    """Decode a bech32 string (nsec/npub) to hex. Minimal implementation."""
-    try:
-        if not bech32_str.startswith(hrp_expected + "1"):
-            return None
-        data_part = bech32_str[len(hrp_expected) + 1:]
-        data_5bit = [BECH32_CHARSET.index(c) for c in data_part[:-6]]  # strip checksum
-        data_8bit = _convertbits(data_5bit, 5, 8, pad=False)
-        return bytes(data_8bit).hex()
-    except Exception:
-        return None
+    # Workspace templates
+    for tmpl in sorted(TEMPLATES_DIR.glob("*.md")):
+        files[f"templates/{tmpl.name}"] = tmpl.read_text()
 
+    # Input parameters for bootstrap (plain text files — no secrets except PayPerQ key)
+    files["agent_name.txt"] = name
+    files["parent_npub.txt"] = parent_npub
+    files["brand.txt"] = brand
+    files["tier.txt"] = tier
+    files["default_model.txt"] = model
 
-def _decode_nsec(nsec: str) -> str | None:
-    """Decode a bech32 nsec to hex private key."""
-    return _decode_bech32("nsec", nsec)
+    # PayPerQ key — the ONLY secret that crosses
+    payperq_key = os.getenv("PAYPERQ_API_KEY", "")
+    if payperq_key:
+        files["payperq_key.txt"] = payperq_key
+    else:
+        log.warning("  PAYPERQ_API_KEY not set — agent will have no LLM access")
+        files["payperq_key.txt"] = ""
 
+    # noscha.io management token — from registration or env override
+    token = noscha_mgmt_token or os.getenv("NOSCHA_MGMT_TOKEN", "")
+    if token:
+        files["noscha_mgmt_token.txt"] = token
 
-def _decode_npub(npub: str) -> str | None:
-    """Decode a bech32 npub to hex public key."""
-    return _decode_bech32("npub", npub)
+    return files
 
 
 # =============================================================================
 # Main orchestrator
 # =============================================================================
 
-def provision(args) -> dict:
+def create_vm(args) -> dict:
     name = args.name.lower().strip()
     parent_npub = args.parent_npub
     tier = args.tier
     brand = args.brand
     dry_run = args.dry_run
-    wisdom = args.wisdom or "Be curious. Be careful. Be kind. Trust math over feelings."
     tier_info = TIERS[tier]
     now = datetime.now(timezone.utc)
-    date_str = now.strftime("%Y-%m-%d")
-    display_name = name.title()
 
     log.info("=" * 64)
-    log.info(f"  SOVEREIGN AGENT PROVISIONING{' [DRY RUN]' if dry_run else ''}")
+    log.info(f"  VM PROVISIONING{' [DRY RUN]' if dry_run else ''}")
     log.info("=" * 64)
-    log.info(f"  Agent:    {name}")
-    log.info(f"  Tier:     {tier} ({tier_info['name']})")
-    log.info(f"  VM class: {tier_info['vm_class']}")
-    log.info(f"  Parent:   {parent_npub}")
-    log.info(f"  Provider: LNVPS (NIP-98 auth)")
+    log.info(f"  Agent name:  {name}")
+    log.info(f"  Tier:        {tier} (VM: {tier_info['vm_class']})")
+    log.info(f"  Parent:      {parent_npub}")
+    log.info(f"  Brand:       {brand}")
     log.info("=" * 64)
 
-    # ── 1. Nostr keypair ─────────────────────────────────────────
-    log.info("\n[1/12] Generating Nostr keypair...")
-    nostr = generate_nostr_keypair()
-    log.info(f"  npub: {nostr['npub']}")
-    log.info(f"  nsec: {nostr['nsec'][:20]}...{nostr['nsec'][-6:]}")
+    # ── 1. Temporary service keypair (for LNVPS auth only) ───────
+    log.info("\n[1/11] Generating temporary service Nostr keypair...")
+    service_key = generate_temp_nostr_keypair()
+    service_npub = bech32_encode("npub", bytes.fromhex(service_key["public_key_hex"]))
+    log.info(f"  Service npub: {service_npub[:30]}... (temporary, discarded after)")
 
-    # ── 2. SSH keypair ───────────────────────────────────────────
-    log.info("\n[2/12] Generating SSH keypair (ed25519)...")
+    # ── 2. Temporary SSH keypair (in memory only) ────────────────
+    log.info("\n[2/11] Generating temporary SSH keypair...")
     ssh = generate_ssh_keypair()
-    log.info(f"  Public key: {ssh['public_key_openssh'][:50]}...")
+    log.info(f"  Public key: {ssh['public_key_openssh'][:50]}... (in memory, never written to disk)")
 
-    # ── 3. BTC wallet ────────────────────────────────────────────
-    log.info("\n[3/12] Generating BTC wallet (BIP-84)...")
-    btc = generate_btc_wallet()
-    log.info(f"  Address:  {btc['address']}")
-    log.info(f"  Mnemonic: {btc['mnemonic'][:30]}... ({len(btc['mnemonic'].split())} words)")
-
-    # ── 4. ETH wallet ────────────────────────────────────────────
-    log.info("\n[4/12] Generating EVM wallet...")
-    eth = generate_eth_wallet()
-    log.info(f"  Address: {eth['address']}")
-
-    # ── 5. noscha.io identity ────────────────────────────────────
-    log.info("\n[5/12] Registering identity on noscha.io...")
-    if not noscha_check(name, dry_run):
-        log.error(f"Username '{name}' is taken on noscha.io")
-        sys.exit(1)
-    noscha = noscha_register(name, nostr["public_key_hex"], "0.0.0.0", dry_run)
-    if noscha.get("bolt11") and not dry_run:
-        log.info(f"\n  ⚡ PAY THIS INVOICE to activate noscha.io identity:")
-        log.info(f"  {noscha['bolt11']}")
-
-    # ── 6. Upload SSH key to LNVPS ───────────────────────────────
-    log.info("\n[6/12] Uploading SSH key to LNVPS...")
-    # Fetch templates and images first
+    # ── 3. Fetch LNVPS templates + images ────────────────────────
+    log.info("\n[3/11] Fetching LNVPS catalog...")
     templates = lnvps_fetch_templates(dry_run)
     image_id = lnvps_fetch_images(dry_run)
     if image_id is None and not dry_run:
-        log.error("Could not find Ubuntu image on LNVPS")
+        log.error("No Ubuntu image found on LNVPS")
         sys.exit(1)
-
-    ssh_key_id = lnvps_upload_ssh_key(
-        nostr["private_key_hex"],
-        f"agent-{name}",
-        ssh['public_key_openssh'],
-        dry_run,
-    )
-
-    # ── 7. Create VM ─────────────────────────────────────────────
-    log.info("\n[7/12] Creating VM on LNVPS...")
     vm_class = tier_info["vm_class"]
     template_id = templates.get(vm_class, {}).get("template_id", 3)
     log.info(f"  Template: {templates.get(vm_class, {}).get('label', vm_class)} (id={template_id})")
+    log.info(f"  Image: Ubuntu (id={image_id})")
 
-    vm_result = lnvps_create_vm(
-        nostr["private_key_hex"],
-        template_id,
-        image_id or 1,
-        ssh_key_id or 1,
-        dry_run,
+    # ── 4. Upload SSH key to LNVPS ───────────────────────────────
+    log.info("\n[4/11] Uploading temporary SSH key to LNVPS...")
+    ssh_key_name = f"provision-{name}-{int(time.time())}"
+    ssh_key_id = lnvps_upload_ssh_key(
+        service_key["private_key_hex"], ssh_key_name,
+        ssh["public_key_openssh"], dry_run,
     )
+    if ssh_key_id is None and not dry_run:
+        log.error("Failed to upload SSH key")
+        sys.exit(1)
 
-    if vm_result.get("bolt11"):
-        log.info(f"\n  ⚡ PAY THIS INVOICE to provision VM:")
-        log.info(f"  {vm_result['bolt11']}")
-        if not dry_run:
-            log.info("  Waiting for payment confirmation...")
-            # In a real flow, you'd pay this automatically via Lightning
-            # or prompt the operator. For now, we poll until VM is active.
+    # ── 5. Create VM ─────────────────────────────────────────────
+    log.info("\n[5/11] Creating VM on LNVPS...")
+    vm = lnvps_create_vm(
+        service_key["private_key_hex"], template_id,
+        image_id or 1, ssh_key_id or 1, dry_run,
+    )
+    if vm.get("bolt11"):
+        log.info(f"\n  ⚡ LIGHTNING INVOICE — pay to provision VM:")
+        log.info(f"  {vm['bolt11']}")
 
-    # ── 8. Wait for VM ───────────────────────────────────────────
-    log.info("\n[8/12] Waiting for VM to come online...")
-    vm_info = lnvps_wait_for_vm(nostr["private_key_hex"], vm_result["vm_id"], dry_run)
+    # ── 6. Wait for VM ───────────────────────────────────────────
+    log.info("\n[6/11] Waiting for VM to boot...")
+    vm_info = lnvps_wait_for_vm(service_key["private_key_hex"], vm["vm_id"], dry_run)
     vps_ip = vm_info["ip"]
     log.info(f"  VM IP: {vps_ip}")
 
-    # ── 9. SSH setup ─────────────────────────────────────────────
-    log.info("\n[9/12] Running setup via SSH...")
-    payperq_key = os.getenv("PAYPERQ_API_KEY", "ppq_placeholder_set_me")
-    config_template = load_file(CONFIG_TEMPLATE_PATH)
-    agent_config = fill(config_template, {
-        "AGENT_NAME": name,
-        "DISPLAY_NAME": display_name,
-        "PAYPERQ_KEY": payperq_key,
-        "NOSTR_NSEC": nostr["nsec"],
-        "PARENT_NPUB": parent_npub,
-        "DATE": date_str,
-        "DEFAULT_MODEL": tier_info["model"],
-    })
-
-    ws_replacements = {
-        "AGENT_NAME": name, "AGENT_NPUB": nostr["npub"],
-        "PARENT_NPUB": parent_npub, "DATE": date_str,
-        "BRAND": "descendant", "TIER": tier,
-        "BTC_ADDRESS": btc["address"], "ETH_ADDRESS": eth["address"],
-        "WEBCHAT_URL": f"https://{name}.noscha.io",
-        "PARENT_WISDOM": wisdom, "DISPLAY_NAME": display_name,
-    }
-    workspace_files = generate_workspace_files(ws_replacements)
-    for fname in sorted(workspace_files):
-        log.info(f"  ✓ {fname} ({len(workspace_files[fname])} bytes)")
-
-    keys_data = {
-        "nostr": {"private_key_hex": nostr["private_key_hex"], "nsec": nostr["nsec"], "npub": nostr["npub"]},
-        "btc": {"mnemonic": btc["mnemonic"], "address": btc["address"], "private_key_wif": btc["private_key_wif"]},
-        "eth": {"address": eth["address"], "private_key": eth["private_key"]},
-        "ssh": {"private_key_pem": ssh["private_key_pem"], "public_key": ssh["public_key_openssh"]},
-        "agent_name": name,
-        "generated_at": now.isoformat(),
-    }
-    keys_json = json.dumps(keys_data, indent=2)
-
-    setup_ok = ssh_run_setup(
-        vps_ip, ssh["private_key_pem"],
-        agent_config, workspace_files, keys_json,
-        dry_run,
-    )
-
-    # ── 10. Update noscha subdomain ──────────────────────────────
-    log.info("\n[10/12] Updating noscha.io subdomain...")
-    noscha_mgmt_token = noscha.get("management_token", "")
-    noscha_update_subdomain(name, vps_ip, noscha_mgmt_token, dry_run)
-
-    # ── 11. Health check ─────────────────────────────────────────
-    log.info("\n[11/13] Verifying OpenClaw health...")
-    healthy = verify_health(vps_ip, dry_run=dry_run)
-
-    # ── 12. Send birth note ──────────────────────────────────────
-    log.info("\n[12/13] Sending birth note to parent...")
-    birth_note_text = generate_birth_note(brand, ws_replacements)
-    # Decode parent npub (bech32) to hex pubkey for Nostr event p-tag
-    parent_pubkey_hex = _decode_npub(parent_npub)
-    if not parent_pubkey_hex:
-        log.warning(f"  Could not decode parent npub — birth note will be logged for manual delivery")
-        parent_pubkey_hex = ""
-    birth_note_sent = send_birth_note(
-        parent_pubkey_hex,
-        birth_note_text,
+    # ── 7. Register noscha.io identity ───────────────────────────
+    # Now that we have the VM IP, register noscha.io with the real IP.
+    # The pubkey is a placeholder (service key) — bootstrap will update it
+    # via management_token once the agent generates its real Nostr keypair.
+    log.info("\n[7/11] Registering noscha.io identity...")
+    noscha_result = noscha_register(
+        username=name,
+        plan="30d",
+        pubkey_hex=service_key["public_key_hex"],  # placeholder — agent updates later
+        target_ip=vps_ip,
         dry_run=dry_run,
     )
+    noscha_mgmt_token = ""
+    noscha_bolt11 = ""
+    if noscha_result.get("error"):
+        log.warning(f"  noscha.io registration issue: {noscha_result['error']}")
+        log.warning(f"  Agent will boot without NIP-05/subdomain — can register manually later")
+    else:
+        noscha_mgmt_token = noscha_result.get("management_token", "")
+        noscha_bolt11 = noscha_result.get("bolt11", "")
+        log.info(f"  NIP-05: {name}@noscha.io")
+        log.info(f"  Subdomain: {name}.noscha.io → {vps_ip}")
+        if noscha_mgmt_token:
+            log.info(f"  Management token: {'yes' if noscha_mgmt_token else 'no'}")
 
-    # ── 13. Summary ──────────────────────────────────────────────
-    log.info("\n[13/13] Done!")
+    # ── 8. Prepare and upload files ──────────────────────────────
+    log.info("\n[8/11] Preparing bootstrap files...")
+    upload_files = prepare_upload_files(
+        name, parent_npub, tier, brand, tier_info["model"],
+        noscha_mgmt_token=noscha_mgmt_token,
+    )
+    log.info(f"  {len(upload_files)} files prepared")
+
+    # ── 9. SSH bootstrap ─────────────────────────────────────────
+    log.info("\n[9/11] Running bootstrap on VPS (agent generates its own identity)...")
+    agent_info = ssh_bootstrap(vps_ip, ssh["private_key_pem"], upload_files, dry_run)
+
+    if agent_info is None and not dry_run:
+        log.error("Bootstrap failed — VM is running but agent may not be configured")
+        log.error(f"  SSH manually: ssh root@{vps_ip}")
+        agent_info = {}
+
+    # ── 10. Cleanup: delete SSH key from LNVPS ───────────────────
+    log.info("\n[10/11] Cleaning up temporary credentials...")
+    lnvps_delete_ssh_key(service_key["private_key_hex"], ssh_key_id, dry_run)
+    # Discard service keypair (just let it go out of scope)
+    service_key_npub = service_npub  # save for logging
+    del service_key
+    log.info("  Service Nostr keypair discarded")
+    log.info("  SSH keypair discarded (was never written to disk)")
+
+    # ── 11. Summary ──────────────────────────────────────────────
+    log.info("\n[11/11] Done!")
+
+    agent_npub = agent_info.get("npub", "unknown")
+    btc_address = agent_info.get("btc_address", "unknown")
+    eth_address = agent_info.get("eth_address", "unknown")
+    nip05 = agent_info.get("nip05", f"{name}@noscha.io")
+
     log.info("")
     log.info("=" * 64)
-    log.info(f"  PROVISIONING COMPLETE" + (" ✓" if (healthy and setup_ok) else " (check status)"))
+    log.info("  PROVISIONING COMPLETE")
     log.info("=" * 64)
+    log.info(f"  Name:       {name}")
+    log.info(f"  VPS IP:     {vps_ip}")
+    log.info(f"  VM ID:      {vm.get('vm_id', '?')}")
     log.info(f"")
-    log.info(f"  Name:           {name}")
-    log.info(f"  Tier:           {tier} ({tier_info['name']})")
-    log.info(f"  Provider:       LNVPS")
-    log.info(f"  VPS IP:         {vps_ip}")
+    log.info(f"  Agent npub: {agent_npub}")
+    log.info(f"  NIP-05:     {nip05}")
+    log.info(f"  Webchat:    http://{vps_ip}:3000")
+    log.info(f"  BTC:        {btc_address}")
+    log.info(f"  ETH:        {eth_address}")
     log.info(f"")
-    log.info(f"  ── Nostr ──")
-    log.info(f"  npub:           {nostr['npub']}")
-    log.info(f"  NIP-05:         {name}@noscha.io")
-    log.info(f"")
-    log.info(f"  ── Web ──")
-    log.info(f"  Webchat:        http://{vps_ip}:3000")
-    log.info(f"  Subdomain:      https://{name}.noscha.io")
-    log.info(f"  Email:          {name}@noscha.io")
-    log.info(f"")
-    log.info(f"  ── Bitcoin ──")
-    log.info(f"  Address:        {btc['address']}")
-    log.info(f"  Mnemonic:       {btc['mnemonic']}")
-    log.info(f"")
-    log.info(f"  ── Ethereum ──")
-    log.info(f"  Address:        {eth['address']}")
-    log.info(f"")
-    log.info(f"  ── SSH ──")
-    log.info(f"  ssh root@{vps_ip}")
-    log.info(f"")
-    log.info(f"  ── Parent ──")
-    log.info(f"  npub:           {parent_npub}")
-    log.info(f"")
-
+    log.info(f"  ⚠️  Agent secrets exist ONLY on the VPS at /opt/agent-keys/")
+    log.info(f"      This machine has NO access to agent private keys.")
     invoices = []
-    if noscha.get("bolt11") and not noscha.get("error"):
-        invoices.append(("noscha.io identity", noscha["bolt11"]))
-    if vm_result.get("bolt11"):
-        invoices.append(("LNVPS VM", vm_result["bolt11"]))
+    if vm.get("bolt11"):
+        invoices.append(("LNVPS VM", vm["bolt11"]))
+    if noscha_bolt11:
+        invoices.append(("noscha.io identity", noscha_bolt11))
     if invoices:
-        log.info("  ⚡ LIGHTNING INVOICES TO PAY:")
-        for label, inv in invoices:
-            log.info(f"  [{label}] {inv}")
         log.info("")
-
-    log.info("  ⚠️  SECURITY:")
-    log.info("  • Private keys at /opt/agent-keys/keys.json on VPS")
-    log.info("  • Back up BTC mnemonic securely")
-    log.info("  • Back up ETH private key securely")
-    log.info("  • SSH private key saved in summary JSON (delete after backup)")
-    log.info("")
+        log.info("  ⚡ LIGHTNING INVOICES:")
+        for label, inv in invoices:
+            log.info(f"    [{label}] {inv}")
+    log.info("=" * 64)
 
     summary = {
-        "name": name, "tier": tier, "date": date_str, "dry_run": dry_run,
+        "name": name,
+        "tier": tier,
+        "brand": brand,
+        "date": now.strftime("%Y-%m-%d"),
+        "dry_run": dry_run,
         "provider": "lnvps",
         "vps_ip": vps_ip,
-        "vm_id": vm_result.get("vm_id", ""),
-        "nostr_npub": nostr["npub"], "nostr_nsec": nostr["nsec"],
-        "nostr_pubkey_hex": nostr["public_key_hex"],
-        "nip05": f"{name}@noscha.io",
+        "vm_id": vm.get("vm_id", ""),
+        "vm_bolt11": vm.get("bolt11", ""),
+        "noscha_bolt11": noscha_bolt11,
+        "noscha_order_id": noscha_result.get("order_id", ""),
+        "noscha_registered": not bool(noscha_result.get("error")),
+        "agent_npub": agent_npub,
+        "agent_nip05": nip05,
+        "agent_btc_address": btc_address,
+        "agent_eth_address": eth_address,
         "webchat_url": f"http://{vps_ip}:3000",
-        "subdomain": f"{name}.noscha.io",
-        "email": f"{name}@noscha.io",
-        "btc_address": btc["address"], "btc_mnemonic": btc["mnemonic"],
-        "btc_wif": btc["private_key_wif"],
-        "eth_address": eth["address"], "eth_private_key": eth["private_key"],
-        "ssh_public_key": ssh["public_key_openssh"],
-        "ssh_private_key_pem": ssh["private_key_pem"],
         "parent_npub": parent_npub,
-        "noscha_bolt11": noscha.get("bolt11", ""),
-        "vm_bolt11": vm_result.get("bolt11", ""),
-        "brand": brand,
-        "health_ok": healthy, "setup_ok": setup_ok,
-        "birth_note_sent": birth_note_sent,
+        "bootstrap_success": agent_info is not None and bool(agent_info),
+        "health_ok": agent_info.get("health_ok", False) if agent_info else False,
+        "birth_note_sent": agent_info.get("birth_note_sent", False) if agent_info else False,
     }
-    summary_path = SCRIPT_DIR / f"agent_{name}_summary.json"
+
+    summary_path = SCRIPT_DIR / f"vm_{name}_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))
-    log.info(f"  Summary saved: {summary_path}")
-    log.info("=" * 64)
+    log.info(f"  Summary: {summary_path}")
+
     return summary
 
 
@@ -1195,41 +974,35 @@ def provision(args) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Provision a Sovereign AI Agent (LNVPS)",
+        description="Create a VPS and bootstrap an autonomous AI agent",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 provision_agent.py --name testling --parent-npub npub1abc... --dry-run
-  python3 provision_agent.py --name myagent --parent-npub npub1abc... --tier evolve
-  python3 provision_agent.py --name myagent --parent-npub npub1abc... --tier trial
-
-Tiers:
-  seed    $99  — Small VM (2CPU/2GB), $15 LLM credit
-  evolve  $149 — Small VM (2CPU/2GB), $40 LLM credit
-  dynasty $299 — Medium VM (4CPU/4GB), $100 LLM credit
-  trial   $5   — Demo VM (1CPU/1GB/5GB), daily billing
+  python3 create_vm.py --name myagent --parent-npub npub1abc... --dry-run
+  python3 create_vm.py --name myagent --parent-npub npub1abc... --tier evolve
+  python3 create_vm.py --name myagent --parent-npub npub1abc... --tier trial --brand nullroute
 
 Environment:
-  PAYPERQ_API_KEY   Injected into agent's OpenClaw config
-        """,
+  PAYPERQ_API_KEY         LLM API key (only secret sent to VPS)
+  WEBHOOK_RECEIVER_URL    Custom webhook URL (default: webhook.site)
+  NOSCHA_MGMT_TOKEN       Pre-paid noscha.io token (skips registration)
+""",
     )
     parser.add_argument("--name", required=True, help="Agent name (3-30 chars, alphanumeric + hyphens)")
     parser.add_argument("--parent-npub", required=True, help="Parent's Nostr npub")
-    parser.add_argument("--tier", default="seed", choices=list(TIERS.keys()), help="Pricing tier (default: seed)")
-    parser.add_argument("--brand", default="descendant", choices=["descendant", "spawnling", "nullroute"], help="Brand identity (default: descendant)")
-    parser.add_argument("--wisdom", default=None, help="Custom parent wisdom for LETTER.md")
-    parser.add_argument("--dry-run", action="store_true", help="Generate everything, skip API calls")
+    parser.add_argument("--tier", default="seed", choices=list(TIERS.keys()))
+    parser.add_argument("--brand", default="descendant", choices=["descendant", "spawnling", "deadrop"])
+    parser.add_argument("--region", default="", help="Preferred region (if LNVPS supports)")
+    parser.add_argument("--dry-run", action="store_true", help="Generate plan, skip API calls")
     args = parser.parse_args()
 
     n = args.name.lower().strip()
-    if not n.replace("-", "").replace("_", "").isalnum():
-        sys.exit("ERROR: Name must be alphanumeric (hyphens/underscores ok)")
-    if len(n) < 3 or len(n) > 30:
-        sys.exit("ERROR: Name must be 3-30 characters")
+    if not n.replace("-", "").replace("_", "").isalnum() or len(n) < 3 or len(n) > 30:
+        sys.exit("ERROR: Name must be 3-30 alphanumeric characters (hyphens/underscores ok)")
     if not args.parent_npub.startswith("npub1"):
         sys.exit("ERROR: Parent npub must start with 'npub1'")
 
-    provision(args)
+    create_vm(args)
 
 
 if __name__ == "__main__":
