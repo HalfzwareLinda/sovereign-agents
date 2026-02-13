@@ -1,12 +1,4 @@
 {
-  "auth": {
-    "profiles": {
-      "openai:default": {
-        "provider": "openai",
-        "mode": "token"
-      }
-    }
-  },
   "agents": {
     "defaults": {
       "models": {
@@ -33,5 +25,9 @@
     "reset": {
       "idleMinutes": 120
     }
+  },
+  "webchat": {
+    "enabled": true,
+    "port": 3000
   }
 }
