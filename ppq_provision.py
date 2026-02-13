@@ -163,8 +163,8 @@ def cmd_provision(args):
         "balance": account["balance"],
     }
 
-    if args.dry_run:
-        print("\n[DRY RUN] Skipping funding. Account created but unfunded.")
+    if args.dry_run or args.create_only:
+        print("\n  Account created (no funding). API key ready for use.")
         result["initial_funding"] = {"status": "skipped"}
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(result, indent=2))
@@ -294,7 +294,8 @@ def main():
     parser.add_argument("--currency", default="SATS", choices=["SATS", "USD"], help="Currency (default: SATS)")
     parser.add_argument("--output", default="/tmp/ppq_credentials.json", help="Output credentials file")
     parser.add_argument("--nwc", default="", help="NWC connection string for automatic Lightning payment")
-    parser.add_argument("--dry-run", action="store_true", help="Create account only, skip funding")
+    parser.add_argument("--create-only", action="store_true", help="Create account and save credentials, skip funding")
+    parser.add_argument("--dry-run", action="store_true", help="Alias for --create-only")
     parser.add_argument("--check-balance", action="store_true", help="Check balance of existing credentials")
     parser.add_argument("--credentials", default="", help="Path to existing credentials (for --check-balance)")
     args = parser.parse_args()

@@ -445,12 +445,37 @@ def _webhook_poll_for_challenge(uuid, timeout_sec=120, dry_run=False):
 
 
 def _noscha_extract_bolt11(html: str) -> str | None:
-    """Extract Lightning bolt11 invoice from noscha.io challenge confirmation HTML."""
+    """Extract Lightning bolt11 invoice from noscha.io challenge confirmation HTML.
+
+    Tries multiple strategies:
+    1. HTML data attributes (data-invoice, data-bolt11, value=)
+    2. JSON embedded in the page
+    3. Raw regex scan for lnbc... strings
+    """
+    # Strategy 1: common HTML attributes
+    for pattern in [
+        r'data-invoice="(lnbc[a-z0-9]+)"',
+        r'data-bolt11="(lnbc[a-z0-9]+)"',
+        r'value="(lnbc[a-z0-9]+)"',
+        r"data-invoice='(lnbc[a-z0-9]+)'",
+    ]:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            return m.group(1)
+
+    # Strategy 2: JSON blob containing lightning_invoice or bolt11
+    for key in ["lightning_invoice", "bolt11", "invoice", "payment_request"]:
+        pattern = rf'"{key}"\s*:\s*"(lnbc[a-z0-9]+)"'
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            return m.group(1)
+
+    # Strategy 3: raw regex — find all lnbc strings, take longest
     matches = re.findall(r"(lnbc[a-z0-9]+)", html, re.IGNORECASE)
-    if not matches:
-        return None
-    # Return the longest match (most likely the full invoice)
-    return max(matches, key=len)
+    if matches:
+        return max(matches, key=len)
+
+    return None
 
 
 def _noscha_poll_order_status(order_id, timeout_sec=600, dry_run=False):
@@ -722,7 +747,7 @@ def _parse_bootstrap_output(output: str) -> dict | None:
 # File preparation
 # =============================================================================
 
-def prepare_upload_files(name, parent_npub, tier, brand, model, noscha_mgmt_token=""):
+def prepare_upload_files(name, parent_npub, tier, brand, model, noscha_mgmt_token="", personality="professional", mission=""):
     """Prepare all files to upload to the VPS for bootstrap."""
     files = {}
 
@@ -761,6 +786,8 @@ def prepare_upload_files(name, parent_npub, tier, brand, model, noscha_mgmt_toke
     files["brand.txt"] = brand
     files["tier.txt"] = tier
     files["default_model.txt"] = model
+    files["personality.txt"] = personality
+    files["mission.txt"] = mission
 
     # PayPerQ key — the ONLY secret that crosses
     payperq_key = os.getenv("PAYPERQ_API_KEY", "")
@@ -880,6 +907,8 @@ def create_vm(args) -> dict:
     upload_files = prepare_upload_files(
         name, parent_npub, tier, brand, tier_info["model"],
         noscha_mgmt_token=noscha_mgmt_token,
+        personality=getattr(args, "personality", "professional"),
+        mission=getattr(args, "mission", ""),
     )
     log.info(f"  {len(upload_files)} files prepared")
 
@@ -992,6 +1021,8 @@ Environment:
     parser.add_argument("--parent-npub", required=True, help="Parent's Nostr npub")
     parser.add_argument("--tier", default="seed", choices=list(TIERS.keys()))
     parser.add_argument("--brand", default="descendant", choices=["descendant", "spawnling", "deadrop"])
+    parser.add_argument("--personality", default="professional", help="Agent personality style")
+    parser.add_argument("--mission", default="", help="Agent's first mission / purpose")
     parser.add_argument("--region", default="", help="Preferred region (if LNVPS supports)")
     parser.add_argument("--dry-run", action="store_true", help="Generate plan, skip API calls")
     args = parser.parse_args()
