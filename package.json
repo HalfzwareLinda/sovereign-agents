@@ -1,0 +1,21 @@
+{
+  "name": "sovereign-agents",
+  "version": "0.1.0",
+  "description": "Open-source provisioning system for deploying autonomous AI agents with dedicated VPS, wallet, identity, and purpose.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HalfzwareLinda/sovereign-agents"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start:provision": "node server.js",
+    "start:invoice": "node nwc-invoice-server.js"
+  },
+  "dependencies": {
+    "@nostr-dev-kit/ndk": "^2.0.0",
+    "ws": "^8.0.0"
+  }
+}
