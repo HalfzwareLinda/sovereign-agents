@@ -581,15 +581,29 @@ fi
 echo ""
 echo "Finalizing..."
 
-# Remove provisioning SSH key from authorized_keys
-PROVISION_KEY_COMMENT="provision-${AGENT_NAME}"
-if [ -f /home/ubuntu/.ssh/authorized_keys ]; then
-    grep -v "${PROVISION_KEY_COMMENT}" /home/ubuntu/.ssh/authorized_keys > /tmp/ak_cleaned 2>/dev/null || true
-    mv /tmp/ak_cleaned /home/ubuntu/.ssh/authorized_keys
-    chmod 600 /home/ubuntu/.ssh/authorized_keys
-    chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys
-    echo "  Provisioning SSH key removed from authorized_keys"
-fi
+# Remove ALL provisioning SSH keys by regenerating authorized_keys
+# The grep-based approach is unreliable: LNVPS may not propagate key comments
+# to authorized_keys, and the key could also be in /root/.ssh/.
+# Instead, generate a fresh agent SSH key and make it the ONLY authorized key.
+AGENT_SSH_DIR="/home/agent/.ssh"
+mkdir -p "${AGENT_SSH_DIR}"
+ssh-keygen -t ed25519 -f "${AGENT_SSH_DIR}/id_ed25519" -N "" -C "agent@${AGENT_NAME}" -q
+chown -R agent:agent "${AGENT_SSH_DIR}"
+chmod 700 "${AGENT_SSH_DIR}"
+chmod 600 "${AGENT_SSH_DIR}/id_ed25519"
+chmod 644 "${AGENT_SSH_DIR}/id_ed25519.pub"
+
+# Overwrite authorized_keys in all possible locations to remove provisioning keys
+for AK_DIR in /home/ubuntu/.ssh /root/.ssh; do
+    if [ -d "$AK_DIR" ]; then
+        # Replace with empty file — provisioning key no longer authorized
+        : > "${AK_DIR}/authorized_keys"
+        chmod 600 "${AK_DIR}/authorized_keys"
+        echo "  Cleared ${AK_DIR}/authorized_keys"
+    fi
+done
+echo "  Provisioning SSH keys removed (authorized_keys regenerated)"
+echo "  Agent SSH key generated at ${AGENT_SSH_DIR}/id_ed25519"
 
 # noscha renewal cron
 if [ -n "${NOSCHA_TOKEN}" ]; then
