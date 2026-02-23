@@ -147,7 +147,11 @@ def _decode_bech32(hrp_expected: str, bech32_str: str) -> str | None:
         if not bech32_str.startswith(hrp_expected + "1"):
             return None
         data_part = bech32_str[len(hrp_expected) + 1:]
-        data_5bit = [BECH32_CHARSET.index(c) for c in data_part[:-6]]
+        all_5bit = [BECH32_CHARSET.index(c) for c in data_part]
+        # Verify checksum (L4: previously only checked prefix)
+        if _bech32_polymod(_bech32_hrp_expand(hrp_expected) + all_5bit) != 1:
+            return None
+        data_5bit = all_5bit[:-6]
         data_8bit = _convertbits(data_5bit, 5, 8, pad=False)
         return bytes(data_8bit).hex()
     except Exception:
@@ -1032,6 +1036,10 @@ Environment:
         sys.exit("ERROR: Name must be 3-30 alphanumeric characters (hyphens/underscores ok)")
     if not args.parent_npub.startswith("npub1"):
         sys.exit("ERROR: Parent npub must start with 'npub1'")
+    # L4: Validate bech32 checksum, not just prefix
+    decoded = _decode_bech32("npub", args.parent_npub)
+    if decoded is None or len(decoded) != 64:  # 32 bytes = 64 hex chars
+        sys.exit("ERROR: Invalid npub — bech32 checksum verification failed")
 
     create_vm(args)
 

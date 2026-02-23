@@ -698,14 +698,19 @@ cat > "${BOOTSTRAP_DIR}/agent_public_info.json" << INFOEOF
 }
 INFOEOF
 
+# Output public info for create_vm.py to parse (must be before cleanup)
 echo ""
 echo "===AGENT_PUBLIC_INFO_START==="
 cat "${BOOTSTRAP_DIR}/agent_public_info.json"
 echo "===AGENT_PUBLIC_INFO_END==="
 
-# Clean up sensitive temp files (keep parent_npub.txt for birth note retry)
-rm -f "${BOOTSTRAP_DIR}/payperq_key.txt"
-rm -f "${BOOTSTRAP_DIR}/noscha_mgmt_token.txt"
+# Clean up entire bootstrap staging directory (L2)
+# Per FUNCTIONAL_DESIGN F2.17: "Delete /tmp/agent-setup/ entirely"
+# The only file we need to keep is the public info JSON (already written above).
+# Copy it out first, then remove the whole directory.
+cp "${BOOTSTRAP_DIR}/agent_public_info.json" /tmp/agent_public_info.json 2>/dev/null || true
+rm -rf "${BOOTSTRAP_DIR}"
+echo "  Cleaned up ${BOOTSTRAP_DIR}"
 
 # Final disk cleanup
 apt-get clean 2>/dev/null || true

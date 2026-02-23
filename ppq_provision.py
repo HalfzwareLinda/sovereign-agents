@@ -292,7 +292,7 @@ def main():
     )
     parser.add_argument("--amount", type=float, default=5000, help="Funding amount (default: 5000)")
     parser.add_argument("--currency", default="SATS", choices=["SATS", "USD"], help="Currency (default: SATS)")
-    parser.add_argument("--output", default="/tmp/ppq_credentials.json", help="Output credentials file")
+    parser.add_argument("--output", default="/opt/agent-keys/ppq_credentials.json", help="Output credentials file")
     parser.add_argument("--nwc", default="", help="NWC connection string for automatic Lightning payment")
     parser.add_argument("--create-only", action="store_true", help="Create account and save credentials, skip funding")
     parser.add_argument("--dry-run", action="store_true", help="Alias for --create-only")
