@@ -190,70 +190,87 @@ echo "[6/14] Generating BTC wallet..."
 pip3 install --break-system-packages -q coincurve 2>/dev/null || true
 
 BTC_JSON=$(python3 -c "
-import secrets, hashlib, json, urllib.request
+import secrets, hashlib, hmac, json, struct, sys, urllib.request
 
+# --- BIP-39: Generate mnemonic from 128-bit entropy ---
 try:
     resp = urllib.request.urlopen('https://raw.githubusercontent.com/bitcoin/bips/master/bip-0039/english.txt', timeout=10)
     wordlist = resp.read().decode().strip().split('\n')
-except:
-    wordlist = None
+    assert len(wordlist) == 2048, f'Expected 2048 words, got {len(wordlist)}'
+except Exception as e:
+    print(json.dumps({'error': f'BIP-39 wordlist fetch failed: {e}'}), file=sys.stderr)
+    sys.exit(1)
 
 entropy = secrets.token_bytes(16)
-if wordlist:
-    h = hashlib.sha256(entropy).digest()
-    cs = bin(h[0])[2:].zfill(8)[:4]
-    bits = bin(int.from_bytes(entropy, 'big'))[2:].zfill(128) + cs
-    mnemonic = ' '.join(wordlist[int(bits[i:i+11], 2)] for i in range(0, 132, 11))
-else:
-    mnemonic = entropy.hex()
+h = hashlib.sha256(entropy).digest()
+cs = bin(h[0])[2:].zfill(8)[:4]
+bits = bin(int.from_bytes(entropy, 'big'))[2:].zfill(128) + cs
+mnemonic = ' '.join(wordlist[int(bits[i:i+11], 2)] for i in range(0, 132, 11))
+
+# --- BIP-39: Mnemonic to seed via PBKDF2 (2048 rounds, no passphrase) ---
+seed = hashlib.pbkdf2_hmac('sha512', mnemonic.encode('utf-8'), b'mnemonic', 2048)
+
+# --- BIP-32: HD key derivation ---
+N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+def hmac512(key, data):
+    return hmac.new(key, data, hashlib.sha512).digest()
+
+def derive_child(parent_key, parent_chain, index):
+    from coincurve import PrivateKey as PK
+    if index >= 0x80000000:
+        data = b'\x00' + parent_key + struct.pack('>I', index)
+    else:
+        pub = PK(parent_key).public_key.format(compressed=True)
+        data = pub + struct.pack('>I', index)
+    I = hmac512(parent_chain, data)
+    child_int = (int.from_bytes(I[:32], 'big') + int.from_bytes(parent_key, 'big')) % N
+    return child_int.to_bytes(32, 'big'), I[32:]
+
+# Master key from seed
+I = hmac512(b'Bitcoin seed', seed)
+key, chain = I[:32], I[32:]
+
+# BIP-84 path: m/84'/0'/0'/0/0
+for idx in [0x80000000 + 84, 0x80000000 + 0, 0x80000000 + 0, 0, 0]:
+    key, chain = derive_child(key, chain, idx)
 
 from coincurve import PrivateKey
-priv_bytes = hashlib.sha256(mnemonic.encode()).digest()
-priv = PrivateKey(priv_bytes)
+priv = PrivateKey(key)
 pub = priv.public_key.format(compressed=True)
 
+# --- Native SegWit (bech32) address ---
 sha = hashlib.sha256(pub).digest()
-import hashlib as hl
-r = hl.new('ripemd160')
-r.update(sha)
-h160 = r.digest()
+r = hashlib.new('ripemd160'); r.update(sha); h160 = r.digest()
 
 CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'
 def polymod(values):
     GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
     chk = 1
     for v in values:
-        b = chk >> 25
-        chk = ((chk & 0x1ffffff) << 5) ^ v
-        for i in range(5):
-            chk ^= GEN[i] if ((b >> i) & 1) else 0
+        b = chk >> 25; chk = ((chk & 0x1ffffff) << 5) ^ v
+        for i in range(5): chk ^= GEN[i] if ((b >> i) & 1) else 0
     return chk
 def hrp_expand(hrp):
     return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
 def convertbits(data, frombits, tobits, pad=True):
     acc, bits, ret, maxv = 0, 0, [], (1 << tobits) - 1
     for v in data:
-        acc = (acc << frombits) | v
-        bits += frombits
-        while bits >= tobits:
-            bits -= tobits
-            ret.append((acc >> bits) & maxv)
-    if pad and bits:
-        ret.append((acc << (tobits - bits)) & maxv)
+        acc = (acc << frombits) | v; bits += frombits
+        while bits >= tobits: bits -= tobits; ret.append((acc >> bits) & maxv)
+    if pad and bits: ret.append((acc << (tobits - bits)) & maxv)
     return ret
 data5 = [0] + convertbits(list(h160), 8, 5)
 chk = polymod(hrp_expand('bc') + data5 + [0]*6) ^ 1
 checksum = [(chk >> 5*(5-i)) & 31 for i in range(6)]
 address = 'bc1' + ''.join(CHARSET[d] for d in data5 + checksum)
 
-payload = b'\x80' + priv_bytes + b'\x01'
+# WIF for the derived child key
+payload = b'\x80' + key + b'\x01'
 cs = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
 alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
-n = int.from_bytes(payload + cs, 'big')
-wif = ''
-while n > 0:
-    n, r = divmod(n, 58)
-    wif = alphabet[r] + wif
+n = int.from_bytes(payload + cs, 'big'); wif = ''
+while n > 0: n, r = divmod(n, 58); wif = alphabet[r] + wif
 
 print(json.dumps({'mnemonic': mnemonic, 'address': address, 'wif': wif, 'derivation': 'm/84h/0h/0h/0/0'}))
 ")
