@@ -294,6 +294,30 @@ echo ""
 echo "[8/14] Securing private keys..."
 mkdir -p "${KEYS_DIR}"
 
+# Split secrets into separate files per FUNCTIONAL_DESIGN.md
+# This limits blast radius: a vulnerability that reads one file doesn't expose all secrets.
+# The NIP-46 bunker only needs nostr.json, not wallet keys.
+
+cat > "${KEYS_DIR}/nostr.json" << NOSTREOF
+{
+  "private_key_hex": "${AGENT_PRIVKEY_HEX}",
+  "nsec": "${AGENT_NSEC}",
+  "npub": "${AGENT_NPUB}",
+  "public_key_hex": "${AGENT_PUBKEY_HEX}",
+  "agent_name": "${AGENT_NAME}",
+  "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+NOSTREOF
+
+cat > "${KEYS_DIR}/btc_wallet.json" << BTCEOF
+$(echo "$BTC_JSON")
+BTCEOF
+
+cat > "${KEYS_DIR}/eth_wallet.json" << ETHEOF
+$(echo "$ETH_JSON")
+ETHEOF
+
+# Write legacy keys.json for backward compatibility with scripts that still read it
 cat > "${KEYS_DIR}/keys.json" << KEYSEOF
 {
   "nostr": {
@@ -311,9 +335,13 @@ cat > "${KEYS_DIR}/keys.json" << KEYSEOF
 KEYSEOF
 
 chmod 700 "${KEYS_DIR}"
+chmod 600 "${KEYS_DIR}/nostr.json"
+chmod 600 "${KEYS_DIR}/btc_wallet.json"
+chmod 600 "${KEYS_DIR}/eth_wallet.json"
 chmod 600 "${KEYS_DIR}/keys.json"
 chown -R root:root "${KEYS_DIR}"
-echo "  Keys secured at ${KEYS_DIR}/keys.json (root:root, 600)"
+echo "  Keys split into separate files at ${KEYS_DIR}/ (root:root, 600)"
+echo "    nostr.json, btc_wallet.json, eth_wallet.json, keys.json (legacy)"
 
 # ------------------------------------------------------------------
 # 9. Process workspace templates (EARLY — before anything else can fail)
@@ -633,6 +661,6 @@ echo "  Finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "  Name:     ${AGENT_NAME}"
 echo "  npub:     ${AGENT_NPUB}"
 echo "  Webchat:  ${WEBCHAT_URL}"
-echo "  Keys at:  ${KEYS_DIR}/keys.json (root-only)"
+echo "  Keys at:  ${KEYS_DIR}/ (nostr.json, btc_wallet.json, eth_wallet.json)"
 echo "  Birth note: ${BIRTH_NOTE_SENT}"
 echo "========================================"

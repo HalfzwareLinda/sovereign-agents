@@ -16,7 +16,9 @@ const NDKModule = require("@nostr-dev-kit/ndk");
 const NDK = NDKModule.default || NDKModule.NDK;
 const { NDKPrivateKeySigner, NDKUser, NDKEvent } = NDKModule;
 
-const KEYS_PATH = "/opt/agent-keys/keys.json";
+const KEYS_PATH = "/opt/agent-keys/nostr.json";
+// Fallback to legacy combined keys.json if nostr.json doesn't exist
+const KEYS_PATH_LEGACY = "/opt/agent-keys/keys.json";
 const PARENT_NPUB_PATH = "/tmp/agent-bootstrap/parent_npub.txt";
 const RELAYS = [
     "wss://relay.damus.io",
@@ -76,11 +78,15 @@ function decodeBech32(str) {
 }
 
 async function main() {
-    // Load keys
-    const keys = JSON.parse(fs.readFileSync(KEYS_PATH, "utf-8"));
-    const nsec = keys.nostr?.nsec;
+    // Load keys — try new separate nostr.json first, fall back to legacy keys.json
+    let keysPath = KEYS_PATH;
+    if (!fs.existsSync(KEYS_PATH) && fs.existsSync(KEYS_PATH_LEGACY)) {
+        keysPath = KEYS_PATH_LEGACY;
+    }
+    const keys = JSON.parse(fs.readFileSync(keysPath, "utf-8"));
+    const nsec = keys.nostr?.nsec || keys.nsec;
     if (!nsec) {
-        console.error("No nsec in", KEYS_PATH);
+        console.error("No nsec in", keysPath);
         process.exit(1);
     }
 
