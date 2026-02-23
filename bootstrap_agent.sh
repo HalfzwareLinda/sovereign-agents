@@ -179,7 +179,7 @@ AGENT_PRIVKEY_HEX=$(echo "$NOSTR_KEYS_JSON" | jq -r '.private_key_hex')
 AGENT_PUBKEY_HEX=$(echo "$NOSTR_KEYS_JSON" | jq -r '.public_key_hex')
 
 echo "  npub: ${AGENT_NPUB}"
-echo "  nsec: ${AGENT_NSEC:0:15}... (never leaves this machine)"
+echo "  nsec: [REDACTED — generated and stored locally only]"
 
 # ------------------------------------------------------------------
 # 6. Generate BTC wallet
