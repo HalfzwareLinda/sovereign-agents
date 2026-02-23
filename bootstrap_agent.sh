@@ -375,8 +375,19 @@ WEBCHAT_URL="http://${VPS_IP}:3000"
 OPENCLAW_DIR="/home/agent/.openclaw"
 mkdir -p "${OPENCLAW_DIR}/workspace"
 
-# Template placeholder replacement — uses %% delimiters with sed to avoid
-# clashing with URLs containing slashes
+# Escape a string for safe use as a sed replacement value.
+# Escapes the sed delimiter (|), backslash, ampersand, and newlines.
+sed_escape() {
+    printf '%s' "$1" | sed -e 's/[|\\&]/\\&/g' -e '$!s/$/\\/'
+}
+
+# Sanitize user-supplied inputs that will be used in sed replacements.
+# PERSONALITY and MISSION originate from web form input and could contain
+# sed control characters (|, &, \) or shell metacharacters.
+PERSONALITY_SAFE=$(sed_escape "${PERSONALITY}")
+MISSION_SAFE=$(sed_escape "${MISSION}")
+
+# Template placeholder replacement — uses | delimiter with sed
 replace_placeholders() {
     local input="$1"
     echo "$input" \
@@ -394,8 +405,8 @@ replace_placeholders() {
         | sed "s|__NOSCHA_DOMAIN__|${NOSCHA_DOMAIN}|g" \
         | sed "s|__CREATED_AT__|${CREATED_AT}|g" \
         | sed "s|__WEBCHAT_URL__|${WEBCHAT_URL}|g" \
-        | sed "s|__PERSONALITY__|${PERSONALITY}|g" \
-        | sed "s|__MISSION__|${MISSION}|g"
+        | sed "s|__PERSONALITY__|${PERSONALITY_SAFE}|g" \
+        | sed "s|__MISSION__|${MISSION_SAFE}|g"
 }
 
 TEMPLATES_WRITTEN=0
@@ -650,10 +661,25 @@ done
 echo "  Provisioning SSH keys removed (authorized_keys regenerated)"
 echo "  Agent SSH key generated at ${AGENT_SSH_DIR}/id_ed25519"
 
-# noscha renewal cron
+# noscha renewal cron — token stored in file, not in crontab command line
+# (M3: prevents token exposure via `ps`, /var/spool/cron/crontabs, or process list)
 if [ -n "${NOSCHA_TOKEN}" ]; then
-    (crontab -u agent -l 2>/dev/null || true; echo "0 0 25 * * curl -sf -H 'Authorization: Bearer ${NOSCHA_TOKEN}' https://noscha.io/api/renew >/dev/null 2>&1") | crontab -u agent -
-    echo "  noscha.io renewal cron set"
+    NOSCHA_TOKEN_FILE="${KEYS_DIR}/noscha_token"
+    printf '%s' "${NOSCHA_TOKEN}" > "${NOSCHA_TOKEN_FILE}"
+    chmod 600 "${NOSCHA_TOKEN_FILE}"
+    chown root:root "${NOSCHA_TOKEN_FILE}"
+
+    cat > "${KEYS_DIR}/noscha_renew.sh" << 'RENEWEOF'
+#!/bin/bash
+TOKEN=$(cat /opt/agent-keys/noscha_token 2>/dev/null)
+[ -z "$TOKEN" ] && exit 0
+curl -sf -H "Authorization: Bearer ${TOKEN}" https://noscha.io/api/renew >/dev/null 2>&1
+RENEWEOF
+    chmod 700 "${KEYS_DIR}/noscha_renew.sh"
+    chown root:root "${KEYS_DIR}/noscha_renew.sh"
+
+    (crontab -u root -l 2>/dev/null || true; echo "0 0 25 * * /opt/agent-keys/noscha_renew.sh") | crontab -u root -
+    echo "  noscha.io renewal cron set (token in file, not command line)"
 fi
 
 # Write public info for create_vm.py to retrieve
