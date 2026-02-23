@@ -110,46 +110,22 @@ async function main() {
     const parentUser = new NDKUser({ pubkey: parentPubHex });
     parentUser.ndk = ndk;
 
-    // Send as NIP-17 private DM (NDK handles gift-wrapping if supported)
-    // NDKEvent kind 14 is the NIP-17 private direct message
-    try {
-        const dmEvent = new NDKEvent(ndk);
-        dmEvent.kind = 14;
-        dmEvent.content = birthNote;
-        dmEvent.tags = [["p", parentPubHex]];
+    // Send as NIP-17 private DM via NDK's sendDM (handles gift-wrapping)
+    // SECURITY: Never fall back to plaintext kind 14 or legacy NIP-04.
+    // If NIP-17 send fails, fail gracefully — agent can retry later.
+    if (typeof parentUser.sendDM !== "function") {
+        console.error("NDK version does not support sendDM (NIP-17). Upgrade @nostr-dev-kit/ndk to >=2.x");
+        console.error("Birth note NOT sent — agent can retry via AGENTS.md instructions");
+        process.exit(1);
+    }
 
-        // NDK's encrypt + gift-wrap flow for NIP-17
-        // If NDK supports nip17 send, use it; otherwise fall back to kind 4
-        if (typeof parentUser.sendDM === "function") {
-            // NDK >=2.x has sendDM which handles NIP-17 gift wrapping
-            await parentUser.sendDM(birthNote);
-            console.log("Birth note sent via NDK sendDM (NIP-17)");
-        } else {
-            // Fallback: kind 4 encrypted DM (NIP-04)
-            const dm = new NDKEvent(ndk);
-            dm.kind = 4;
-            dm.content = birthNote;
-            dm.tags = [["p", parentPubHex]];
-            await dm.encrypt(parentUser);
-            await dm.sign();
-            await dm.publish();
-            console.log("Birth note sent via NIP-04 DM (fallback)");
-        }
+    try {
+        await parentUser.sendDM(birthNote);
+        console.log("Birth note sent via NDK sendDM (NIP-17 gift-wrapped)");
     } catch (err) {
-        console.error("Failed to send via DM, trying raw kind 14:", err.message);
-        // Last resort: publish unsigned kind 14 (some relays accept)
-        try {
-            const raw = new NDKEvent(ndk);
-            raw.kind = 14;
-            raw.content = birthNote;
-            raw.tags = [["p", parentPubHex]];
-            await raw.sign();
-            await raw.publish();
-            console.log("Birth note published as kind 14 (no gift wrap)");
-        } catch (err2) {
-            console.error("Birth note send failed entirely:", err2.message);
-            process.exit(1);
-        }
+        console.error("Birth note send failed:", err.message);
+        console.error("Birth note NOT sent — agent can retry via AGENTS.md instructions");
+        process.exit(1);
     }
 
     // Give relays time to propagate
