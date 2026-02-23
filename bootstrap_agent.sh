@@ -288,16 +288,16 @@ echo "[7/14] Generating ETH wallet..."
 pip3 install --break-system-packages -q eth-account 2>/dev/null || true
 
 ETH_JSON=$(python3 -c "
-import json
+import json, sys
 try:
     from eth_account import Account
     acct = Account.create()
     print(json.dumps({'address': acct.address, 'private_key': acct.key.hex()}))
 except ImportError:
-    import secrets, hashlib
-    key = secrets.token_bytes(32)
-    print(json.dumps({'address': '0x' + hashlib.sha256(key).hexdigest()[:40], 'private_key': key.hex(), 'note': 'simplified'}))
-" 2>/dev/null || echo '{"address": "unavailable", "private_key": "", "note": "eth-account not available"}')
+    # eth-account not available — skip ETH wallet rather than generate an invalid address
+    print(json.dumps({'address': 'unavailable', 'private_key': '', 'note': 'eth-account not installed — ETH wallet skipped'}))
+    print('WARNING: eth-account not available, ETH wallet not generated', file=sys.stderr)
+")
 
 ETH_ADDRESS=$(echo "$ETH_JSON" | jq -r '.address')
 echo "  ETH address: ${ETH_ADDRESS}"
