@@ -53,14 +53,43 @@ function loadBirthNote(keys) {
     ].join("\n");
 }
 
-// Bech32 decode (npub → hex pubkey)
+// Bech32 decode with checksum verification (npub → hex pubkey)
 const CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+function bech32Polymod(values) {
+    const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+    let chk = 1;
+    for (const v of values) {
+        const b = chk >> 25;
+        chk = ((chk & 0x1ffffff) << 5) ^ v;
+        for (let i = 0; i < 5; i++) if ((b >> i) & 1) chk ^= GEN[i];
+    }
+    return chk;
+}
+
+function bech32Verify(hrp, data5WithChecksum) {
+    const hrpExpand = [];
+    for (const c of hrp) hrpExpand.push(c.charCodeAt(0) >> 5);
+    hrpExpand.push(0);
+    for (const c of hrp) hrpExpand.push(c.charCodeAt(0) & 31);
+    return bech32Polymod(hrpExpand.concat(data5WithChecksum)) === 1;
+}
+
 function decodeBech32(str) {
     const hrpLen = str.lastIndexOf("1");
-    const data5 = str
-        .slice(hrpLen + 1, -6)
+    const hrp = str.slice(0, hrpLen);
+    const allData5 = str
+        .slice(hrpLen + 1)
         .split("")
         .map((c) => CHARSET.indexOf(c));
+
+    // Verify checksum (L5: previously stripped but never verified)
+    if (!bech32Verify(hrp, allData5)) {
+        throw new Error(`Invalid bech32 checksum for ${str.slice(0, 12)}...`);
+    }
+
+    // Strip the 6-character checksum
+    const data5 = allData5.slice(0, -6);
     let acc = 0,
         bits = 0,
         result = [];
