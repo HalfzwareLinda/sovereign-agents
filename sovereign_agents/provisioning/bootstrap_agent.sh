@@ -606,9 +606,11 @@ chown -R agent:agent "${OPENCLAW_DIR}"
 # --bind lan: accept connections from the local network (not just loopback)
 # --force: kill any stale listener on port 3000 before starting
 echo "  Starting OpenClaw gateway..."
+GATEWAY_LOG="/home/agent/openclaw-gateway.log"
+touch "${GATEWAY_LOG}" && chown agent:agent "${GATEWAY_LOG}"
 sudo -u agent bash -c \
     "nohup /usr/bin/openclaw gateway run --bind lan --force \
-     > /var/log/openclaw-gateway.log 2>&1 &"
+     > ${GATEWAY_LOG} 2>&1 &"
 
 # Wait for health check (up to 60s)
 HEALTH_OK=false
@@ -644,11 +646,12 @@ if [ -f "${KEYS_DIR}/send_birth_note.js" ] && [ -n "${PARENT_NPUB}" ]; then
         echo "I've read your letter. Thank you." >> "${BOOTSTRAP_DIR}/birth_note_rendered.txt"
     fi
 
-    NODE_PATH=/opt/agent-ndk/node_modules node "${KEYS_DIR}/send_birth_note.js" 2>&1 && {
+    # 60s timeout — the script connects to Nostr relays and may hang if they're slow
+    timeout 60 bash -c "NODE_PATH=/opt/agent-ndk/node_modules node '${KEYS_DIR}/send_birth_note.js'" 2>&1 && {
         BIRTH_NOTE_SENT=true
         echo "  Birth note sent to parent"
     } || {
-        echo "  Birth note send failed — agent can retry via AGENTS.md instructions"
+        echo "  Birth note send failed (exit $?) — agent can retry via AGENTS.md instructions"
     }
 else
     echo "  Skipped (no parent npub or send script missing)"
