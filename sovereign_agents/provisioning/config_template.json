@@ -1,0 +1,33 @@
+{
+  "agents": {
+    "defaults": {
+      "models": {
+        "__DEFAULT_MODEL__": {}
+      },
+      "compaction": {
+        "mode": "default",
+        "memoryFlush": {
+          "enabled": true
+        }
+      }
+    },
+    "list": [
+      {
+        "id": "main",
+        "default": true
+      }
+    ]
+  },
+  "gateway": {
+    "mode": "local",
+    "port": 3000,
+    "controlUi": {
+      "dangerouslyAllowHostHeaderOriginFallback": true
+    }
+  },
+  "session": {
+    "reset": {
+      "idleMinutes": 120
+    }
+  }
+}
