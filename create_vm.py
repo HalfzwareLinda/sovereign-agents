@@ -6,7 +6,7 @@ Creates a VPS on LNVPS and bootstraps an autonomous AI agent on it.
 All agent secrets (Nostr keys, wallets) are generated ON the VPS — never here.
 
 This script only handles infrastructure:
-  1. Generate TEMPORARY service Nostr keypair (for LNVPS NIP-98 auth only)
+  1. Load PERSISTENT operator Nostr keypair from .env (for LNVPS NIP-98 auth)
   2. Generate TEMPORARY SSH ed25519 keypair (held in memory, never written to disk)
   3. Fetch LNVPS templates/images, upload SSH key
   4. Create VM → surface Lightning invoice for payment
@@ -14,7 +14,7 @@ This script only handles infrastructure:
   6. SSH into VM: upload bootstrap_agent.sh + templates + config inputs
   7. Execute bootstrap_agent.sh remotely (agent generates its own identity)
   8. Retrieve agent's public info (npub, addresses) from bootstrap output
-  9. Delete SSH key from LNVPS, discard service keypair
+  9. Delete SSH key from LNVPS
   10. Output JSON summary (NO agent secrets — only public info)
 
 Usage:
@@ -22,6 +22,8 @@ Usage:
     python3 create_vm.py --name myagent --parent-npub npub1abc... --tier evolve
 
 Environment:
+    LNVPS_SECRET_KEY_HEX    LNVPS operator private key (hex) — for NIP-98 auth
+    LNVPS_PUBLIC_KEY_HEX    LNVPS operator public key (hex)
     PAYPERQ_API_KEY         PayPerQ API key — the ONLY secret that crosses to the VPS
     WEBHOOK_RECEIVER_URL    (optional) Custom webhook receiver URL (default: webhook.site)
     NOSCHA_MGMT_TOKEN       (optional) Pre-paid noscha.io management token (skips registration)
@@ -193,11 +195,20 @@ def nip98_auth_header(privkey_hex: str, url: str, method: str, body: bytes | Non
     return f"Nostr {encoded}"
 
 
-def generate_temp_nostr_keypair() -> dict:
-    """Generate a temporary Nostr keypair for LNVPS auth. Discarded after use."""
-    privkey = PrivateKey(secrets.token_bytes(32))
-    priv_hex = privkey.secret.hex()
-    pub_hex = privkey.public_key.format(compressed=True)[1:].hex()
+def load_operator_keypair() -> dict:
+    """Load the persistent LNVPS operator keypair from .env for NIP-98 auth.
+
+    All VMs are created under this dedicated identity so they can be managed
+    from one LNVPS account (verified via email). Separate from the public
+    messaging keypair (NOSTR_*).
+    """
+    priv_hex = os.environ.get("LNVPS_SECRET_KEY_HEX")
+    pub_hex = os.environ.get("LNVPS_PUBLIC_KEY_HEX")
+    if not priv_hex or not pub_hex:
+        sys.exit(
+            "ERROR: LNVPS_SECRET_KEY_HEX and LNVPS_PUBLIC_KEY_HEX must be set in .env\n"
+            "       Generate a keypair and add it to sovereign-agents/.env"
+        )
     return {"private_key_hex": priv_hex, "public_key_hex": pub_hex}
 
 
@@ -223,26 +234,58 @@ def generate_ssh_keypair() -> dict:
 # LNVPS API
 # =============================================================================
 
-def lnvps_request(method, path, privkey_hex=None, json_body=None, dry_run=False):
+from retry_request import retry_request, RetryExhaustedError
+
+
+def lnvps_request(method, path, privkey_hex=None, json_body=None, dry_run=False,
+                   timeout_sec=None):
+    """Make an LNVPS API request with automatic retry on transient failures.
+
+    Returns parsed JSON on success. Raises RetryExhaustedError if the API stays
+    down for the full retry window (~15 min default). Raises on 4xx client errors.
+
+    Args:
+        timeout_sec: Override retry window (default 15 min). Use shorter values
+                     for polling loops that have their own outer retry.
+    """
     url = f"{LNVPS_API}{path}"
     if dry_run:
         log.info(f"  [DRY RUN] {method} {url}")
         return None
 
-    headers = {"Content-Type": "application/json"}
     body_bytes = json.dumps(json_body).encode() if json_body else None
-    if privkey_hex:
-        headers["Authorization"] = nip98_auth_header(privkey_hex, url, method, body_bytes)
+
+    def _prepare_headers():
+        """Re-sign NIP-98 auth on each retry attempt (created_at must be fresh)."""
+        h = {}
+        if privkey_hex:
+            h["Authorization"] = nip98_auth_header(privkey_hex, url, method, body_bytes)
+        return h
+
+    retry_kwargs = {}
+    if timeout_sec is not None:
+        retry_kwargs["timeout_sec"] = timeout_sec
+
+    resp = retry_request(
+        method,
+        url,
+        prepare_headers=_prepare_headers,
+        headers={"Content-Type": "application/json"},
+        data=body_bytes,
+        label=f"LNVPS {method} {path}",
+        log_fn=lambda msg: log.warning(f"  {msg}"),
+        **retry_kwargs,
+    )
+
+    # 4xx — raise so callers get a clear error instead of silent None
+    if resp.status_code >= 400:
+        log.warning(f"  LNVPS {method} {path} → HTTP {resp.status_code}: {resp.text[:300]}")
+        resp.raise_for_status()
 
     try:
-        resp = requests.request(method, url, headers=headers, data=body_bytes, timeout=30)
-        if resp.status_code in (200, 201):
-            return resp.json()
-        log.warning(f"  LNVPS {method} {path} → HTTP {resp.status_code}: {resp.text[:300]}")
-        return None
-    except requests.RequestException as exc:
-        log.warning(f"  LNVPS {method} {path} → {exc}")
-        return None
+        return resp.json()
+    except ValueError:
+        return {}  # 204 No Content or empty body
 
 
 def lnvps_delete_ssh_key(privkey_hex, key_id, dry_run=False):
@@ -250,22 +293,29 @@ def lnvps_delete_ssh_key(privkey_hex, key_id, dry_run=False):
     if dry_run:
         log.info(f"  [DRY RUN] Would delete SSH key {key_id} from LNVPS")
         return True
-    result = lnvps_request("DELETE", f"/api/v1/ssh-key/{key_id}", privkey_hex)
-    if result is not None:
+    try:
+        lnvps_request("DELETE", f"/api/v1/ssh-key/{key_id}", privkey_hex)
         log.info(f"  SSH key {key_id} deleted from LNVPS")
-        return True
-    # DELETE may return 204 No Content — check if the request didn't error
-    log.info(f"  SSH key {key_id} delete request sent")
+    except (RetryExhaustedError, requests.HTTPError) as exc:
+        log.warning(f"  SSH key {key_id} delete failed: {exc} (non-critical)")
     return True
 
 
 def lnvps_fetch_templates(dry_run=False):
     if dry_run:
         return {k: {"template_id": i + 1, "label": k} for i, k in enumerate(VM_CLASSES)}
-    data = lnvps_request("GET", "/api/v1/vm/templates")
+    try:
+        data = lnvps_request("GET", "/api/v1/vm/templates")
+    except (RetryExhaustedError, requests.HTTPError) as exc:
+        raise RuntimeError(
+            f"LNVPS API unreachable — cannot determine template IDs. "
+            f"Provisioning aborted. Retry when LNVPS is back online. Error: {exc}"
+        )
     if not data:
-        log.warning("  Could not fetch templates — using fallback IDs")
-        return {k: {"template_id": i + 1, "label": f"{k} (fallback)"} for i, k in enumerate(VM_CLASSES)}
+        raise RuntimeError(
+            "LNVPS returned empty template list — cannot determine template IDs. "
+            "Provisioning aborted. Check LNVPS API status."
+        )
 
     result = {}
     # API returns {"data": {"templates": [...]}}
@@ -286,7 +336,10 @@ def lnvps_fetch_templates(dry_run=False):
 def lnvps_fetch_images(dry_run=False):
     if dry_run:
         return 1
-    data = lnvps_request("GET", "/api/v1/image")
+    try:
+        data = lnvps_request("GET", "/api/v1/image")
+    except (RetryExhaustedError, requests.HTTPError):
+        return None
     if not data:
         return None
     # API returns {"data": [list of images]} — images have "distribution" + "version", not "name"
@@ -311,13 +364,11 @@ def lnvps_upload_ssh_key(privkey_hex, key_name, public_key, dry_run=False):
         return 999
     data = lnvps_request("POST", "/api/v1/ssh-key", privkey_hex,
                          json_body={"name": key_name, "key_data": public_key})
-    if data:
-        # API returns {"data": {"id": N, ...}}
-        inner = data.get("data", data) if isinstance(data, dict) else data
-        key_id = inner.get("id") if isinstance(inner, dict) else data.get("id")
-        log.info(f"  SSH key uploaded: id={key_id}")
-        return key_id
-    return None
+    # API returns {"data": {"id": N, ...}}
+    inner = data.get("data", data) if isinstance(data, dict) else data
+    key_id = inner.get("id") if isinstance(inner, dict) else data.get("id")
+    log.info(f"  SSH key uploaded: id={key_id}")
+    return key_id
 
 
 def lnvps_create_vm(privkey_hex, template_id, image_id, ssh_key_id, dry_run=False):
@@ -326,9 +377,6 @@ def lnvps_create_vm(privkey_hex, template_id, image_id, ssh_key_id, dry_run=Fals
         log.info(f"  [DRY RUN] Would create VM: {json.dumps(body)}")
         return {"vm_id": "dry-run-vm", "bolt11": "lnbc1...dry_run", "status": "pending_payment"}
     data = lnvps_request("POST", "/api/v1/vm", privkey_hex, json_body=body)
-    if not data:
-        log.error("VM creation failed")
-        sys.exit(1)
     # API returns {"data": {"id": N, ...}} — invoice NOT included in create response
     inner = data.get("data", data) if isinstance(data, dict) else data
     vm_id = inner.get("id") or inner.get("vm_id")
@@ -336,10 +384,12 @@ def lnvps_create_vm(privkey_hex, template_id, image_id, ssh_key_id, dry_run=Fals
     # Get payment invoice from renew endpoint
     bolt11 = ""
     log.info(f"  VM created: id={vm_id} — fetching payment invoice...")
-    renew_data = lnvps_request("GET", f"/api/v1/vm/{vm_id}/renew?method=lightning", privkey_hex)
-    if renew_data:
+    try:
+        renew_data = lnvps_request("GET", f"/api/v1/vm/{vm_id}/renew?method=lightning", privkey_hex)
         renew_inner = renew_data.get("data", renew_data) if isinstance(renew_data, dict) else renew_data
         bolt11 = (renew_inner.get("data", {}).get("lightning", "") if isinstance(renew_inner, dict) else "")
+    except (RetryExhaustedError, requests.HTTPError) as exc:
+        log.warning(f"  Could not fetch payment invoice: {exc}")
     return {"vm_id": vm_id, "bolt11": bolt11, "raw": data}
 
 
@@ -348,7 +398,13 @@ def lnvps_wait_for_vm(privkey_hex, vm_id, dry_run=False):
         return {"ip": "203.0.113.42", "status": "running"}
     log.info("  Polling VM status...")
     for attempt in range(1, 61):
-        data = lnvps_request("GET", f"/api/v1/vm/{vm_id}", privkey_hex)
+        try:
+            # Short retry window per poll — outer loop handles long-term retrying
+            data = lnvps_request("GET", f"/api/v1/vm/{vm_id}", privkey_hex,
+                                 timeout_sec=30)
+        except (RetryExhaustedError, requests.HTTPError):
+            # Individual poll failure is OK — VM may still be provisioning
+            data = None
         if data:
             # API returns {"data": {...}} wrapper
             inner = data.get("data", data) if isinstance(data, dict) else data
@@ -751,7 +807,7 @@ def _parse_bootstrap_output(output: str) -> dict | None:
 # File preparation
 # =============================================================================
 
-def prepare_upload_files(name, parent_npub, tier, brand, model, noscha_mgmt_token="", personality="professional", mission=""):
+def prepare_upload_files(name, parent_npub, tier, brand, model, noscha_mgmt_token="", personality="professional", mission="", parent_wisdom="", llm_base_url="", keep_ssh=False):
     """Prepare all files to upload to the VPS for bootstrap."""
     files = {}
 
@@ -792,6 +848,7 @@ def prepare_upload_files(name, parent_npub, tier, brand, model, noscha_mgmt_toke
     files["default_model.txt"] = model
     files["personality.txt"] = personality
     files["mission.txt"] = mission
+    files["parent_wisdom.txt"] = parent_wisdom
 
     # PayPerQ key — the ONLY secret that crosses
     payperq_key = os.getenv("PAYPERQ_API_KEY", "")
@@ -805,6 +862,14 @@ def prepare_upload_files(name, parent_npub, tier, brand, model, noscha_mgmt_toke
     token = noscha_mgmt_token or os.getenv("NOSCHA_MGMT_TOKEN", "")
     if token:
         files["noscha_mgmt_token.txt"] = token
+
+    # LLM base URL (defaults to PPQ, can be overridden for direct OpenAI etc.)
+    if llm_base_url:
+        files["llm_base_url.txt"] = llm_base_url
+
+    # Dev/test flag: keep SSH access after bootstrap
+    if keep_ssh:
+        files["keep_ssh.txt"] = "true"
 
     return files
 
@@ -831,16 +896,23 @@ def create_vm(args) -> dict:
     log.info(f"  Brand:       {brand}")
     log.info("=" * 64)
 
-    # ── 1. Temporary service keypair (for LNVPS auth only) ───────
-    log.info("\n[1/11] Generating temporary service Nostr keypair...")
-    service_key = generate_temp_nostr_keypair()
+    # ── 1. Persistent operator keypair (for LNVPS auth) ─────────
+    log.info("\n[1/11] Loading operator Nostr keypair from .env...")
+    service_key = load_operator_keypair()
     service_npub = bech32_encode("npub", bytes.fromhex(service_key["public_key_hex"]))
-    log.info(f"  Service npub: {service_npub[:30]}... (temporary, discarded after)")
+    log.info(f"  Operator npub: {service_npub[:30]}... (persistent, all VMs under this identity)")
 
     # ── 2. Temporary SSH keypair (in memory only) ────────────────
     log.info("\n[2/11] Generating temporary SSH keypair...")
     ssh = generate_ssh_keypair()
     log.info(f"  Public key: {ssh['public_key_openssh'][:50]}... (in memory, never written to disk)")
+
+    # Save SSH key to file if requested (for post-bootstrap debugging)
+    if getattr(args, "save_ssh_key", False) or getattr(args, "keep_ssh", False):
+        pem_path = SCRIPT_DIR / f"vm_{name}_ssh.pem"
+        pem_path.write_text(ssh["private_key_pem"])
+        pem_path.chmod(0o600)
+        log.info(f"  SSH key saved: {pem_path}")
 
     # ── 3. Fetch LNVPS templates + images ────────────────────────
     log.info("\n[3/11] Fetching LNVPS catalog...")
@@ -908,11 +980,15 @@ def create_vm(args) -> dict:
 
     # ── 8. Prepare and upload files ──────────────────────────────
     log.info("\n[8/11] Preparing bootstrap files...")
+    model = getattr(args, "model", "") or tier_info["model"]
     upload_files = prepare_upload_files(
-        name, parent_npub, tier, brand, tier_info["model"],
+        name, parent_npub, tier, brand, model,
         noscha_mgmt_token=noscha_mgmt_token,
         personality=getattr(args, "personality", "professional"),
         mission=getattr(args, "mission", ""),
+        parent_wisdom=getattr(args, "parent_wisdom", ""),
+        llm_base_url=getattr(args, "llm_base_url", ""),
+        keep_ssh=getattr(args, "keep_ssh", False),
     )
     log.info(f"  {len(upload_files)} files prepared")
 
@@ -926,13 +1002,18 @@ def create_vm(args) -> dict:
         agent_info = {}
 
     # ── 10. Cleanup: delete SSH key from LNVPS ───────────────────
-    log.info("\n[10/11] Cleaning up temporary credentials...")
-    lnvps_delete_ssh_key(service_key["private_key_hex"], ssh_key_id, dry_run)
+    if getattr(args, "keep_ssh", False):
+        log.info("\n[10/11] Skipping SSH key cleanup (--keep-ssh)")
+        log.info(f"  SSH key remains on LNVPS (id={ssh_key_id})")
+        log.info(f"  SSH: ssh -i vm_{name}_ssh.pem ubuntu@{vps_ip}")
+    else:
+        log.info("\n[10/11] Cleaning up temporary credentials...")
+        lnvps_delete_ssh_key(service_key["private_key_hex"], ssh_key_id, dry_run)
+        log.info("  SSH keypair discarded (was never written to disk)")
     # Discard service keypair (just let it go out of scope)
     service_key_npub = service_npub  # save for logging
     del service_key
     log.info("  Service Nostr keypair discarded")
-    log.info("  SSH keypair discarded (was never written to disk)")
 
     # ── 11. Summary ──────────────────────────────────────────────
     log.info("\n[11/11] Done!")
@@ -994,6 +1075,11 @@ def create_vm(args) -> dict:
         "birth_note_sent": agent_info.get("birth_note_sent", False) if agent_info else False,
     }
 
+    if getattr(args, "keep_ssh", False):
+        pem_file = f"vm_{name}_ssh.pem"
+        summary["ssh_key_file"] = pem_file
+        summary["ssh_command"] = f"ssh -i {pem_file} ubuntu@{vps_ip}"
+
     summary_path = SCRIPT_DIR / f"vm_{name}_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))
     log.info(f"  Summary: {summary_path}")
@@ -1013,7 +1099,11 @@ def main():
 Examples:
   python3 create_vm.py --name myagent --parent-npub npub1abc... --dry-run
   python3 create_vm.py --name myagent --parent-npub npub1abc... --tier evolve
-  python3 create_vm.py --name myagent --parent-npub npub1abc... --tier trial --brand nullroute
+
+  # Live E2E test with direct OpenAI key, SSH preserved for debugging:
+  PAYPERQ_API_KEY="sk-..." python3 create_vm.py --name testpilot \\
+    --parent-npub npub1abc... --tier evolve --keep-ssh \\
+    --llm-base-url "https://api.openai.com/v1" --model gpt-4o-mini
 
 Environment:
   PAYPERQ_API_KEY         LLM API key (only secret sent to VPS)
@@ -1027,8 +1117,17 @@ Environment:
     parser.add_argument("--brand", default="descendant", choices=["descendant", "spawnling", "deadrop"])
     parser.add_argument("--personality", default="professional", help="Agent personality style")
     parser.add_argument("--mission", default="", help="Agent's first mission / purpose")
+    parser.add_argument("--parent-wisdom", default="", help="Parent's wisdom for the agent's LETTER.md")
     parser.add_argument("--region", default="", help="Preferred region (if LNVPS supports)")
     parser.add_argument("--dry-run", action="store_true", help="Generate plan, skip API calls")
+    parser.add_argument("--keep-ssh", action="store_true",
+                        help="Keep provisioning SSH key (don't delete from LNVPS, preserve authorized_keys, auto-save PEM)")
+    parser.add_argument("--save-ssh-key", action="store_true",
+                        help="Save provisioning SSH private key to ./vm_<name>_ssh.pem")
+    parser.add_argument("--llm-base-url", default="https://api.ppq.ai",
+                        help="LLM API base URL (default: https://api.ppq.ai, use https://api.openai.com/v1 for OpenAI)")
+    parser.add_argument("--model", default="",
+                        help="Override default LLM model (default: tier-specific, e.g. gpt-5-nano)")
     args = parser.parse_args()
 
     n = args.name.lower().strip()
