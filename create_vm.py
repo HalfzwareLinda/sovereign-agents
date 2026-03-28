@@ -789,6 +789,117 @@ def ssh_bootstrap(ip, ssh_private_key_pem, upload_files, dry_run=False):
         client.close()
 
 
+def ssh_retry_bootstrap(ip, ssh_private_key_pem, resume_from_step, upload_files=None, dry_run=False):
+    """SSH into an existing VM and re-run bootstrap from the given step.
+
+    The VM already has keys and partial bootstrap state. We upload fresh copies
+    of scripts/templates (in case they were cleaned up), set RESUME_FROM_STEP,
+    and re-execute bootstrap_agent.sh.
+
+    Returns dict with agent's public info, or None on failure.
+    """
+    if dry_run:
+        log.info(f"  [DRY RUN] Would retry bootstrap on {ip} from step {resume_from_step}")
+        return {"npub": "npub1dryrun...", "btc_address": "bc1qdryrun..."}
+
+    try:
+        import paramiko
+    except ImportError:
+        sys.exit("ERROR: paramiko not installed. Run: pip install paramiko")
+
+    pkey = paramiko.Ed25519Key.from_private_key(io.StringIO(ssh_private_key_pem))
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    log.info(f"  Connecting to ubuntu@{ip} for retry...")
+    connected = False
+    for attempt in range(1, 7):
+        try:
+            client.connect(ip, username="ubuntu", pkey=pkey, timeout=10)
+            connected = True
+            log.info(f"  SSH connected (attempt {attempt})")
+            break
+        except Exception:
+            if attempt % 3 == 0:
+                log.info(f"  SSH not ready (attempt {attempt})...")
+            time.sleep(5)
+
+    if not connected:
+        log.error(f"  Could not SSH to {ip} for retry")
+        return None
+
+    try:
+        sftp = client.open_sftp()
+
+        # Re-create bootstrap staging directory (it was cleaned up by step 15)
+        for d in ["/tmp/agent-bootstrap", "/tmp/agent-bootstrap/templates"]:
+            try:
+                sftp.mkdir(d)
+            except IOError:
+                pass
+
+        # Upload fresh files if provided
+        if upload_files:
+            for remote_name, content in upload_files.items():
+                remote_path = f"/tmp/agent-bootstrap/{remote_name}"
+                parent = "/tmp/agent-bootstrap/" + "/".join(remote_name.split("/")[:-1])
+                if "/" in remote_name:
+                    try:
+                        sftp.mkdir(parent)
+                    except IOError:
+                        pass
+                with sftp.open(remote_path, "w") as f:
+                    f.write(content)
+            log.info(f"  Re-uploaded {len(upload_files)} files")
+
+        sftp.close()
+
+        # Execute bootstrap with RESUME_FROM_STEP
+        log.info(f"  Running bootstrap from step {resume_from_step}...")
+        _, stdout, stderr = client.exec_command(
+            f"chmod +x /tmp/agent-bootstrap/bootstrap_agent.sh && "
+            f"RESUME_FROM_STEP={resume_from_step} "
+            f"sudo -E bash /tmp/agent-bootstrap/bootstrap_agent.sh 2>&1",
+            timeout=900,
+        )
+        exit_code = stdout.channel.recv_exit_status()
+        output = stdout.read().decode(errors="replace")
+        err = stderr.read().decode(errors="replace")
+
+        if exit_code != 0:
+            log.error(f"  Retry bootstrap failed (exit {exit_code})")
+            for line in (err or output).strip().split("\n")[-15:]:
+                log.error(f"    {line}")
+            return None
+
+        log.info("  Retry bootstrap completed successfully")
+        for line in output.strip().split("\n")[-8:]:
+            log.info(f"    {line}")
+
+        agent_info = _parse_bootstrap_output(output)
+
+        if not agent_info:
+            try:
+                sftp2 = client.open_sftp()
+                with sftp2.open("/tmp/agent-bootstrap/agent_public_info.json", "r") as f:
+                    agent_info = json.loads(f.read())
+                sftp2.close()
+            except Exception:
+                # Try the copied location
+                try:
+                    sftp2 = client.open_sftp()
+                    with sftp2.open("/tmp/agent_public_info.json", "r") as f:
+                        agent_info = json.loads(f.read())
+                    sftp2.close()
+                except Exception:
+                    pass
+
+        return agent_info
+
+    finally:
+        client.close()
+
+
 def _parse_bootstrap_output(output: str) -> dict | None:
     """Parse the JSON public info block from bootstrap stdout."""
     # Bootstrap writes a JSON block between markers
@@ -907,8 +1018,14 @@ def create_vm(args) -> dict:
     ssh = generate_ssh_keypair()
     log.info(f"  Public key: {ssh['public_key_openssh'][:50]}... (in memory, never written to disk)")
 
-    # Save SSH key to file if requested (for post-bootstrap debugging)
-    if getattr(args, "save_ssh_key", False) or getattr(args, "keep_ssh", False):
+    # Save SSH key to file if requested (for post-bootstrap debugging or retry)
+    ssh_key_save_path = getattr(args, "ssh_key_save_path", "")
+    if ssh_key_save_path:
+        pem_path = Path(ssh_key_save_path)
+        pem_path.write_text(ssh["private_key_pem"])
+        pem_path.chmod(0o600)
+        log.info(f"  SSH key saved: {pem_path} (for retry)")
+    elif getattr(args, "save_ssh_key", False) or getattr(args, "keep_ssh", False):
         pem_path = SCRIPT_DIR / f"vm_{name}_ssh.pem"
         pem_path.write_text(ssh["private_key_pem"])
         pem_path.chmod(0o600)
@@ -1088,6 +1205,93 @@ def create_vm(args) -> dict:
 
 
 # =============================================================================
+# Retry mode — re-run bootstrap on an existing VM
+# =============================================================================
+
+def retry_vm(args) -> dict:
+    """Retry bootstrap on an existing VM using a saved SSH key.
+
+    Used by server.js when a provisioning job failed. SSHes back into the VM,
+    re-uploads scripts, and runs bootstrap with RESUME_FROM_STEP so completed
+    steps (especially key generation) are not repeated.
+    """
+    name = args.name.lower().strip()
+    vm_ip = args.vm_ip
+    ssh_key_file = Path(args.ssh_key_file)
+    resume_from = args.resume_from_step
+
+    log.info("=" * 64)
+    log.info(f"  RETRY BOOTSTRAP")
+    log.info("=" * 64)
+    log.info(f"  Agent name:       {name}")
+    log.info(f"  VM IP:            {vm_ip}")
+    log.info(f"  SSH key:          {ssh_key_file}")
+    log.info(f"  Resume from step: {resume_from}")
+    log.info("=" * 64)
+
+    if not ssh_key_file.exists():
+        sys.exit(f"ERROR: SSH key file not found: {ssh_key_file}")
+
+    ssh_pem = ssh_key_file.read_text()
+
+    # Prepare fresh upload files for the retry
+    tier = getattr(args, "tier", "seed")
+    brand = getattr(args, "brand", "descendant")
+    tier_info = TIERS.get(tier, TIERS["seed"])
+    model = getattr(args, "model", "") or tier_info["model"]
+
+    upload_files = prepare_upload_files(
+        name,
+        getattr(args, "parent_npub", ""),
+        tier,
+        brand,
+        model,
+        personality=getattr(args, "personality", "professional"),
+        mission=getattr(args, "mission", ""),
+        parent_wisdom=getattr(args, "parent_wisdom", ""),
+        llm_base_url=getattr(args, "llm_base_url", ""),
+        keep_ssh=True,  # Keep SSH for further retries if this one also fails
+    )
+
+    agent_info = ssh_retry_bootstrap(
+        vm_ip, ssh_pem, resume_from,
+        upload_files=upload_files,
+        dry_run=getattr(args, "dry_run", False),
+    )
+
+    if agent_info is None:
+        log.error("Retry bootstrap failed")
+        agent_info = {}
+
+    # Write updated summary
+    summary = {
+        "name": name,
+        "tier": tier,
+        "brand": brand,
+        "retry": True,
+        "resume_from_step": resume_from,
+        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "provider": "lnvps",
+        "vps_ip": vm_ip,
+        "agent_npub": agent_info.get("npub", "unknown"),
+        "agent_nip05": agent_info.get("nip05", f"{name}@noscha.io"),
+        "agent_btc_address": agent_info.get("btc_address", "unknown"),
+        "agent_eth_address": agent_info.get("eth_address", "unknown"),
+        "webchat_url": agent_info.get("webchat_url", f"https://{name}.noscha.io"),
+        "parent_npub": getattr(args, "parent_npub", ""),
+        "bootstrap_success": bool(agent_info),
+        "health_ok": agent_info.get("health_ok", False) if agent_info else False,
+        "birth_note_sent": agent_info.get("birth_note_sent", False) if agent_info else False,
+    }
+
+    summary_path = SCRIPT_DIR / f"vm_{name}_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2))
+    log.info(f"  Summary: {summary_path}")
+
+    return summary
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -1099,6 +1303,11 @@ def main():
 Examples:
   python3 create_vm.py --name myagent --parent-npub npub1abc... --dry-run
   python3 create_vm.py --name myagent --parent-npub npub1abc... --tier evolve
+
+  # Retry a failed bootstrap on an existing VM:
+  python3 create_vm.py --retry --name myagent --parent-npub npub1abc... \\
+    --vm-ip 51.68.216.214 --ssh-key-file /opt/provision/jobs/abc123_ssh.pem \\
+    --resume-from-step 13
 
   # Live E2E test with direct OpenAI key, SSH preserved for debugging:
   PAYPERQ_API_KEY="sk-..." python3 create_vm.py --name testpilot \\
@@ -1128,6 +1337,21 @@ Environment:
                         help="LLM API base URL (default: https://api.ppq.ai, use https://api.openai.com/v1 for OpenAI)")
     parser.add_argument("--model", default="",
                         help="Override default LLM model (default: tier-specific, e.g. gpt-5-nano)")
+
+    # SSH key save path (used by provisioning server to persist key for retry)
+    parser.add_argument("--ssh-key-save-path", default="",
+                        help="Save SSH private key to this path (for server-managed retry)")
+
+    # Retry mode arguments
+    parser.add_argument("--retry", action="store_true",
+                        help="Retry bootstrap on an existing VM instead of creating a new one")
+    parser.add_argument("--vm-ip", default="",
+                        help="VM IP address (required for --retry)")
+    parser.add_argument("--ssh-key-file", default="",
+                        help="Path to SSH private key PEM file (required for --retry)")
+    parser.add_argument("--resume-from-step", type=int, default=0,
+                        help="Resume bootstrap from this step number (0 = detect from checkpoints)")
+
     args = parser.parse_args()
 
     n = args.name.lower().strip()
@@ -1140,7 +1364,14 @@ Environment:
     if decoded is None or len(decoded) != 64:  # 32 bytes = 64 hex chars
         sys.exit("ERROR: Invalid npub — bech32 checksum verification failed")
 
-    create_vm(args)
+    if args.retry:
+        if not args.vm_ip:
+            sys.exit("ERROR: --vm-ip is required for --retry mode")
+        if not args.ssh_key_file:
+            sys.exit("ERROR: --ssh-key-file is required for --retry mode")
+        retry_vm(args)
+    else:
+        create_vm(args)
 
 
 if __name__ == "__main__":

@@ -27,7 +27,41 @@ export DEBIAN_FRONTEND=noninteractive
 BOOTSTRAP_DIR="/tmp/agent-bootstrap"
 LOG="/var/log/agent-bootstrap.log"
 KEYS_DIR="/opt/agent-keys"
+STATE_DIR="/opt/agent-state"
 exec > >(tee -a "$LOG") 2>&1
+
+# ------------------------------------------------------------------
+# Checkpoint system — enables retry from failed step
+# ------------------------------------------------------------------
+mkdir -p "${STATE_DIR}"
+
+# RESUME_FROM_STEP: if set, skip all steps before this number.
+# Used by create_vm.py --retry to resume after a failure.
+RESUME_FROM_STEP="${RESUME_FROM_STEP:-0}"
+
+mark_step_done() {
+    local step="$1"
+    touch "${STATE_DIR}/step_${step}.done"
+    echo "  [checkpoint] Step ${step} complete"
+}
+
+step_already_done() {
+    local step="$1"
+    [ -f "${STATE_DIR}/step_${step}.done" ]
+}
+
+should_skip_step() {
+    local step="$1"
+    if [ "${step}" -lt "${RESUME_FROM_STEP}" ]; then
+        echo "  [resume] Skipping step ${step} (resuming from ${RESUME_FROM_STEP})"
+        return 0
+    fi
+    if step_already_done "${step}"; then
+        echo "  [idempotent] Step ${step} already completed — skipping"
+        return 0
+    fi
+    return 1
+}
 
 echo "========================================"
 echo "  Agent Self-Birth"
@@ -60,65 +94,96 @@ echo "  Parent: ${PARENT_NPUB}"
 # ------------------------------------------------------------------
 echo ""
 echo "[1/15] Installing system packages..."
-apt-get update -qq
-apt-get upgrade -y -qq
-apt-get install -y -qq \
-    curl \
-    wget \
-    jq \
-    ufw \
-    git \
-    python3 \
-    python3-pip \
-    unattended-upgrades \
-    fail2ban
+if should_skip_step 1; then
+    true  # skip
+else
+    apt-get update -qq
+    apt-get upgrade -y -qq
+    apt-get install -y -qq \
+        curl \
+        wget \
+        jq \
+        ufw \
+        git \
+        python3 \
+        python3-pip \
+        unattended-upgrades \
+        fail2ban
 
-# Free disk space — critical for Demo tier (5GB)
-apt-get clean
-apt-get autoremove -y -qq
-rm -rf /var/lib/apt/lists/* /usr/src/ /root/.cache/pip 2>/dev/null || true
+    # Free disk space — critical for Demo tier (5GB)
+    apt-get clean
+    apt-get autoremove -y -qq
+    rm -rf /var/lib/apt/lists/* /usr/src/ /root/.cache/pip 2>/dev/null || true
 
-dpkg-reconfigure -f noninteractive unattended-upgrades 2>/dev/null || true
+    dpkg-reconfigure -f noninteractive unattended-upgrades 2>/dev/null || true
+    mark_step_done 1
+fi
 
 # ------------------------------------------------------------------
 # 2. Install Node.js v22+ (LTS — required by OpenClaw)
 # ------------------------------------------------------------------
 echo ""
 echo "[2/15] Installing Node.js..."
-if ! command -v node &>/dev/null || [[ $(node -v | cut -d'.' -f1 | tr -d 'v') -lt 22 ]]; then
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-    apt-get install -y -qq nodejs
-    apt-get clean
-    rm -rf /var/lib/apt/lists/*
+if should_skip_step 2; then
+    true  # skip
+else
+    if ! command -v node &>/dev/null || [[ $(node -v | cut -d'.' -f1 | tr -d 'v') -lt 22 ]]; then
+        curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+        apt-get install -y -qq nodejs
+        apt-get clean
+        rm -rf /var/lib/apt/lists/*
+    fi
+    echo "  Node.js $(node -v), npm $(npm -v)"
+    mark_step_done 2
 fi
-echo "  Node.js $(node -v), npm $(npm -v)"
 
 # ------------------------------------------------------------------
 # 3. Firewall
 # ------------------------------------------------------------------
 echo ""
 echo "[3/15] Configuring firewall..."
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow 22/tcp    comment 'SSH'
-ufw allow 3000/tcp  comment 'OpenClaw webchat'
-ufw allow 443/tcp   comment 'HTTPS'
-ufw allow 80/tcp    comment 'HTTP'
-ufw --force enable
-echo "  Ports open: 22, 80, 443, 3000"
+if should_skip_step 3; then
+    true  # skip
+else
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw allow 22/tcp    comment 'SSH'
+    ufw allow 3000/tcp  comment 'OpenClaw webchat'
+    ufw allow 443/tcp   comment 'HTTPS'
+    ufw allow 80/tcp    comment 'HTTP'
+    ufw --force enable
+    echo "  Ports open: 22, 80, 443, 3000"
+    mark_step_done 3
+fi
 
 # ------------------------------------------------------------------
 # 4. Create agent user
 # ------------------------------------------------------------------
 echo ""
 echo "[4/15] Creating agent user..."
-useradd -m -s /bin/bash agent 2>/dev/null || true
+if should_skip_step 4; then
+    true  # skip
+else
+    useradd -m -s /bin/bash agent 2>/dev/null || true
+    mark_step_done 4
+fi
 
 # ------------------------------------------------------------------
 # 5. Generate Nostr keypair ON THIS MACHINE
 # ------------------------------------------------------------------
 echo ""
 echo "[5/15] Generating Nostr identity (keys born here, stay here)..."
+if should_skip_step 5 || [ -f "${KEYS_DIR}/nostr.json" ]; then
+    # Keys already exist — load them instead of regenerating
+    if [ -f "${KEYS_DIR}/nostr.json" ]; then
+        echo "  Nostr keys already exist at ${KEYS_DIR}/nostr.json — reusing"
+        AGENT_NSEC=$(jq -r '.nsec' "${KEYS_DIR}/nostr.json")
+        AGENT_NPUB=$(jq -r '.npub' "${KEYS_DIR}/nostr.json")
+        AGENT_PRIVKEY_HEX=$(jq -r '.private_key_hex' "${KEYS_DIR}/nostr.json")
+        AGENT_PUBKEY_HEX=$(jq -r '.public_key_hex' "${KEYS_DIR}/nostr.json")
+        mark_step_done 5
+    fi
+else
 
 NOSTR_KEYS_JSON=$(node -e "
 const crypto = require('crypto');
@@ -186,12 +251,25 @@ AGENT_PUBKEY_HEX=$(echo "$NOSTR_KEYS_JSON" | jq -r '.public_key_hex')
 
 echo "  npub: ${AGENT_NPUB}"
 echo "  nsec: [REDACTED — generated and stored locally only]"
+mark_step_done 5
+fi  # end of step 5 idempotency guard
 
 # ------------------------------------------------------------------
 # 6. Generate BTC wallet
 # ------------------------------------------------------------------
 echo ""
 echo "[6/15] Generating BTC wallet..."
+if should_skip_step 6 || [ -f "${KEYS_DIR}/btc_wallet.json" ]; then
+    # Wallet already exists — load address
+    if [ -f "${KEYS_DIR}/btc_wallet.json" ]; then
+        echo "  BTC wallet already exists at ${KEYS_DIR}/btc_wallet.json — reusing"
+        BTC_ADDRESS=$(jq -r '.address' "${KEYS_DIR}/btc_wallet.json")
+        BTC_MNEMONIC=$(jq -r '.mnemonic' "${KEYS_DIR}/btc_wallet.json")
+        BTC_JSON=$(cat "${KEYS_DIR}/btc_wallet.json")
+        echo "  BTC address: ${BTC_ADDRESS}"
+        mark_step_done 6
+    fi
+else
 
 pip3 install --break-system-packages -q coincurve requests 2>/dev/null || true
 
@@ -284,12 +362,23 @@ print(json.dumps({'mnemonic': mnemonic, 'address': address, 'wif': wif, 'derivat
 BTC_ADDRESS=$(echo "$BTC_JSON" | jq -r '.address')
 BTC_MNEMONIC=$(echo "$BTC_JSON" | jq -r '.mnemonic')
 echo "  BTC address: ${BTC_ADDRESS}"
+mark_step_done 6
+fi  # end of step 6 idempotency guard
 
 # ------------------------------------------------------------------
 # 7. Generate ETH wallet
 # ------------------------------------------------------------------
 echo ""
 echo "[7/15] Generating ETH wallet..."
+if should_skip_step 7 || [ -f "${KEYS_DIR}/eth_wallet.json" ]; then
+    if [ -f "${KEYS_DIR}/eth_wallet.json" ]; then
+        echo "  ETH wallet already exists at ${KEYS_DIR}/eth_wallet.json — reusing"
+        ETH_ADDRESS=$(jq -r '.address' "${KEYS_DIR}/eth_wallet.json")
+        ETH_JSON=$(cat "${KEYS_DIR}/eth_wallet.json")
+        echo "  ETH address: ${ETH_ADDRESS}"
+        mark_step_done 7
+    fi
+else
 
 pip3 install --break-system-packages -q eth-account 2>/dev/null || true
 
@@ -309,12 +398,17 @@ ETH_ADDRESS=$(echo "$ETH_JSON" | jq -r '.address')
 echo "  ETH address: ${ETH_ADDRESS}"
 
 rm -rf /root/.cache/pip 2>/dev/null || true
+mark_step_done 7
+fi  # end of step 7 idempotency guard
 
 # ------------------------------------------------------------------
 # 8. Secure key storage
 # ------------------------------------------------------------------
 echo ""
 echo "[8/15] Securing private keys..."
+if should_skip_step 8; then
+    true  # skip
+else
 mkdir -p "${KEYS_DIR}"
 
 # Split secrets into separate files per FUNCTIONAL_DESIGN.md
@@ -383,6 +477,8 @@ PUBEOF
 chown agent:agent "${KEYS_DIR}/agent_public.json"
 chmod 644 "${KEYS_DIR}/agent_public.json"
 echo "    agent_public.json (agent:agent, 644 — public info only)"
+mark_step_done 8
+fi  # end of step 8
 
 # ------------------------------------------------------------------
 # 9. Process workspace templates (EARLY — before anything else can fail)
@@ -390,14 +486,18 @@ echo "    agent_public.json (agent:agent, 644 — public info only)"
 echo ""
 echo "[9/15] Writing workspace templates..."
 
+# These vars are needed by later steps regardless of whether step 9 runs
 VPS_IP=$(curl -4 -sf ifconfig.me || echo "unknown")
 NOSCHA_DOMAIN="${AGENT_NAME}.noscha.io"
 LN_ADDRESS="${AGENT_NAME}@noscha.io"
 CREATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-# Use HTTPS URL — Caddy reverse proxy is installed in step 14
 WEBCHAT_URL="https://${AGENT_NAME}.noscha.io"
-
 OPENCLAW_DIR="/home/agent/.openclaw"
+
+if should_skip_step 9; then
+    true  # skip
+else
+
 mkdir -p "${OPENCLAW_DIR}/workspace"
 
 # Escape a string for safe use as a sed replacement value.
@@ -473,12 +573,21 @@ MEMEOF
 TEMPLATES_WRITTEN=$((TEMPLATES_WRITTEN + 1))
 
 echo "  ${TEMPLATES_WRITTEN} workspace files written"
+mark_step_done 9
+fi  # end of step 9
 
 # ------------------------------------------------------------------
 # 10. Provision PPQ.ai LLM account (if no key provided externally)
 # ------------------------------------------------------------------
 echo ""
 echo "[10/15] Provisioning PPQ.ai LLM account..."
+if should_skip_step 10; then
+    # Load existing key if available
+    PPQ_CREDENTIALS="/opt/agent-keys/ppq_credentials.json"
+    if [ -z "${PAYPERQ_KEY}" ] && [ -f "${PPQ_CREDENTIALS}" ]; then
+        PAYPERQ_KEY=$(python3 -c "import json; print(json.load(open('${PPQ_CREDENTIALS}'))['api_key'])" 2>/dev/null || echo "")
+    fi
+else
 
 PPQ_CREDENTIALS="/opt/agent-keys/ppq_credentials.json"
 if [ -n "${PAYPERQ_KEY}" ]; then
@@ -503,27 +612,37 @@ elif [ -f "${BOOTSTRAP_DIR}/ppq_provision.py" ]; then
 else
     echo "  No PayPerQ key and no ppq_provision.py — agent will have no LLM access"
 fi
+mark_step_done 10
+fi  # end of step 10
 
 # ------------------------------------------------------------------
 # 11. Install npm packages (mcp-money, NDK)
 # ------------------------------------------------------------------
 echo ""
 echo "[11/15] Installing npm packages..."
-npm install -g --production mcp-money 2>/dev/null || echo "  mcp-money install skipped"
+if should_skip_step 11; then
+    true  # skip
+else
+    npm install -g --production mcp-money 2>/dev/null || echo "  mcp-money install skipped"
 
-mkdir -p /opt/agent-ndk && cd /opt/agent-ndk
-npm init -y 2>/dev/null
-npm install --production @nostr-dev-kit/ndk 2>/dev/null || echo "  NDK install partial"
-chown -R agent:agent /opt/agent-ndk
-cd /
+    mkdir -p /opt/agent-ndk && cd /opt/agent-ndk
+    npm init -y 2>/dev/null
+    npm install --production @nostr-dev-kit/ndk 2>/dev/null || echo "  NDK install partial"
+    chown -R agent:agent /opt/agent-ndk
+    cd /
 
-npm cache clean --force 2>/dev/null || true
+    npm cache clean --force 2>/dev/null || true
+    mark_step_done 11
+fi
 
 # ------------------------------------------------------------------
 # 12. NIP-46 Nostr Connect bunker (NDKNip46Backend)
 # ------------------------------------------------------------------
 echo ""
 echo "[12/15] Setting up NIP-46 bunker (NDK backend)..."
+if should_skip_step 12; then
+    true  # skip
+else
 
 # Copy scripts to keys directory
 if [ -f "${BOOTSTRAP_DIR}/nip46-server.js" ]; then
@@ -560,17 +679,30 @@ systemctl daemon-reload
 systemctl enable agent-bunker
 systemctl start agent-bunker 2>/dev/null || echo "  Bunker start deferred"
 echo "  NIP-46 bunker service installed"
+mark_step_done 12
+fi  # end of step 12
 
 # ------------------------------------------------------------------
 # 13. Install and configure OpenClaw
 # ------------------------------------------------------------------
 echo ""
 echo "[13/15] Installing OpenClaw..."
+if should_skip_step 13; then
+    # Need these vars for later steps
+    OPENCLAW_INSTALLED=true
+    HEALTH_OK=true
+else
 
 OPENCLAW_INSTALLED=false
 
+# Idempotency: check if openclaw is already available from a previous run
+if command -v openclaw &>/dev/null; then
+    echo "  OpenClaw already installed: $(openclaw --version 2>/dev/null || echo 'present')"
+    OPENCLAW_INSTALLED=true
+fi
+
 # Stage 1: npm global install (primary — Node 22 satisfies >=22.12.0 requirement)
-if npm install -g --production openclaw@latest 2>/dev/null; then
+if [ "$OPENCLAW_INSTALLED" = false ] && npm install -g --production openclaw@latest 2>/dev/null; then
     echo "  OpenClaw installed via npm"
     OPENCLAW_INSTALLED=true
 fi
@@ -693,12 +825,18 @@ if [ "$OPENCLAW_INSTALLED" = true ]; then
 else
     echo "  Health check skipped (OpenClaw not installed)"
 fi
+mark_step_done 13
+fi  # end of step 13
 
 # ------------------------------------------------------------------
 # 14. Install Caddy reverse proxy for HTTPS (ISSUE-002)
 # ------------------------------------------------------------------
 echo ""
 echo "[14/15] Setting up Caddy reverse proxy (HTTPS)..."
+if should_skip_step 14; then
+    CADDY_OK=true
+    WEBCHAT_URL="https://${AGENT_NAME}.noscha.io"
+else
 
 CADDY_OK=false
 
@@ -762,12 +900,17 @@ else
     echo "  Check: journalctl -u caddy --no-pager -n 20"
     WEBCHAT_URL="http://${VPS_IP}:3000"
 fi
+mark_step_done 14
+fi  # end of step 14
 
 # ------------------------------------------------------------------
 # 15. Send birth note to parent
 # ------------------------------------------------------------------
 echo ""
 echo "[15/15] Sending birth note to parent..."
+if should_skip_step 15; then
+    BIRTH_NOTE_SENT=true
+else
 
 BIRTH_NOTE_SENT=false
 if [ -f "${KEYS_DIR}/send_birth_note.js" ] && [ -n "${PARENT_NPUB}" ]; then
@@ -793,6 +936,8 @@ if [ -f "${KEYS_DIR}/send_birth_note.js" ] && [ -n "${PARENT_NPUB}" ]; then
 else
     echo "  Skipped (no parent npub or send script missing)"
 fi
+mark_step_done 15
+fi  # end of step 15
 
 # ------------------------------------------------------------------
 # Post-bootstrap: cleanup + finalize
