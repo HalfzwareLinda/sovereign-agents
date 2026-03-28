@@ -13,6 +13,9 @@
 #   default_model.txt       Default LLM model
 #   payperq_key.txt         PayPerQ API key (only external secret)
 #   noscha_mgmt_token.txt   (optional) Pre-paid noscha.io management token
+#   parent_wisdom.txt       (optional) Parent's wisdom for LETTER.md
+#   llm_base_url.txt        (optional) LLM API base URL (default: https://api.ppq.ai)
+#   keep_ssh.txt            (optional) "true" to preserve provisioning SSH keys
 #   config_template.json    OpenClaw config template
 #   nip46-server.js         NIP-46 bunker script
 #   send_birth_note.js      Birth note sender script
@@ -41,6 +44,9 @@ PAYPERQ_KEY=$(cat "${BOOTSTRAP_DIR}/payperq_key.txt" 2>/dev/null || echo "")
 NOSCHA_TOKEN=$(cat "${BOOTSTRAP_DIR}/noscha_mgmt_token.txt" 2>/dev/null || echo "")
 PERSONALITY=$(cat "${BOOTSTRAP_DIR}/personality.txt" 2>/dev/null || echo "professional")
 MISSION=$(cat "${BOOTSTRAP_DIR}/mission.txt" 2>/dev/null || echo "")
+PARENT_WISDOM=$(cat "${BOOTSTRAP_DIR}/parent_wisdom.txt" 2>/dev/null || echo "Trust your instincts. Verify everything. Keep your keys safe.")
+LLM_BASE_URL=$(cat "${BOOTSTRAP_DIR}/llm_base_url.txt" 2>/dev/null || echo "https://api.ppq.ai")
+KEEP_SSH=$(cat "${BOOTSTRAP_DIR}/keep_ssh.txt" 2>/dev/null || echo "false")
 DATE=$(date -u +%Y-%m-%d)
 DISPLAY_NAME=$(echo "${AGENT_NAME}" | sed 's/\b\(.\)/\u\1/g')
 
@@ -53,7 +59,7 @@ echo "  Parent: ${PARENT_NPUB}"
 # 1. System packages
 # ------------------------------------------------------------------
 echo ""
-echo "[1/14] Installing system packages..."
+echo "[1/15] Installing system packages..."
 apt-get update -qq
 apt-get upgrade -y -qq
 apt-get install -y -qq \
@@ -75,12 +81,12 @@ rm -rf /var/lib/apt/lists/* /usr/src/ /root/.cache/pip 2>/dev/null || true
 dpkg-reconfigure -f noninteractive unattended-upgrades 2>/dev/null || true
 
 # ------------------------------------------------------------------
-# 2. Install Node.js v20+
+# 2. Install Node.js v22+ (LTS — required by OpenClaw)
 # ------------------------------------------------------------------
 echo ""
-echo "[2/14] Installing Node.js..."
-if ! command -v node &>/dev/null || [[ $(node -v | cut -d'.' -f1 | tr -d 'v') -lt 20 ]]; then
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+echo "[2/15] Installing Node.js..."
+if ! command -v node &>/dev/null || [[ $(node -v | cut -d'.' -f1 | tr -d 'v') -lt 22 ]]; then
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
     apt-get install -y -qq nodejs
     apt-get clean
     rm -rf /var/lib/apt/lists/*
@@ -91,7 +97,7 @@ echo "  Node.js $(node -v), npm $(npm -v)"
 # 3. Firewall
 # ------------------------------------------------------------------
 echo ""
-echo "[3/14] Configuring firewall..."
+echo "[3/15] Configuring firewall..."
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp    comment 'SSH'
@@ -105,14 +111,14 @@ echo "  Ports open: 22, 80, 443, 3000"
 # 4. Create agent user
 # ------------------------------------------------------------------
 echo ""
-echo "[4/14] Creating agent user..."
+echo "[4/15] Creating agent user..."
 useradd -m -s /bin/bash agent 2>/dev/null || true
 
 # ------------------------------------------------------------------
 # 5. Generate Nostr keypair ON THIS MACHINE
 # ------------------------------------------------------------------
 echo ""
-echo "[5/14] Generating Nostr identity (keys born here, stay here)..."
+echo "[5/15] Generating Nostr identity (keys born here, stay here)..."
 
 NOSTR_KEYS_JSON=$(node -e "
 const crypto = require('crypto');
@@ -185,9 +191,9 @@ echo "  nsec: [REDACTED — generated and stored locally only]"
 # 6. Generate BTC wallet
 # ------------------------------------------------------------------
 echo ""
-echo "[6/14] Generating BTC wallet..."
+echo "[6/15] Generating BTC wallet..."
 
-pip3 install --break-system-packages -q coincurve 2>/dev/null || true
+pip3 install --break-system-packages -q coincurve requests 2>/dev/null || true
 
 BTC_JSON=$(python3 -c "
 import secrets, hashlib, hmac, json, struct, sys, urllib.request
@@ -283,7 +289,7 @@ echo "  BTC address: ${BTC_ADDRESS}"
 # 7. Generate ETH wallet
 # ------------------------------------------------------------------
 echo ""
-echo "[7/14] Generating ETH wallet..."
+echo "[7/15] Generating ETH wallet..."
 
 pip3 install --break-system-packages -q eth-account 2>/dev/null || true
 
@@ -308,7 +314,7 @@ rm -rf /root/.cache/pip 2>/dev/null || true
 # 8. Secure key storage
 # ------------------------------------------------------------------
 echo ""
-echo "[8/14] Securing private keys..."
+echo "[8/15] Securing private keys..."
 mkdir -p "${KEYS_DIR}"
 
 # Split secrets into separate files per FUNCTIONAL_DESIGN.md
@@ -360,17 +366,36 @@ chown -R root:root "${KEYS_DIR}"
 echo "  Keys split into separate files at ${KEYS_DIR}/ (root:root, 600)"
 echo "    nostr.json, btc_wallet.json, eth_wallet.json, keys.json (legacy)"
 
+# Write public-only info file readable by the agent user (ISSUE-003)
+# Contains NO private keys — only public identifiers the agent needs for self-identification
+BTC_ADDRESS=$(echo "$BTC_JSON" | jq -r '.address')
+cat > "${KEYS_DIR}/agent_public.json" << PUBEOF
+{
+  "npub": "${AGENT_NPUB}",
+  "public_key_hex": "${AGENT_PUBKEY_HEX}",
+  "btc_address": "${BTC_ADDRESS}",
+  "eth_address": "${ETH_ADDRESS}",
+  "agent_name": "${AGENT_NAME}",
+  "nip05": "${AGENT_NAME}@noscha.io",
+  "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+PUBEOF
+chown agent:agent "${KEYS_DIR}/agent_public.json"
+chmod 644 "${KEYS_DIR}/agent_public.json"
+echo "    agent_public.json (agent:agent, 644 — public info only)"
+
 # ------------------------------------------------------------------
 # 9. Process workspace templates (EARLY — before anything else can fail)
 # ------------------------------------------------------------------
 echo ""
-echo "[9/14] Writing workspace templates..."
+echo "[9/15] Writing workspace templates..."
 
 VPS_IP=$(curl -4 -sf ifconfig.me || echo "unknown")
 NOSCHA_DOMAIN="${AGENT_NAME}.noscha.io"
 LN_ADDRESS="${AGENT_NAME}@noscha.io"
 CREATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-WEBCHAT_URL="http://${VPS_IP}:3000"
+# Use HTTPS URL — Caddy reverse proxy is installed in step 14
+WEBCHAT_URL="https://${AGENT_NAME}.noscha.io"
 
 OPENCLAW_DIR="/home/agent/.openclaw"
 mkdir -p "${OPENCLAW_DIR}/workspace"
@@ -386,6 +411,7 @@ sed_escape() {
 # sed control characters (|, &, \) or shell metacharacters.
 PERSONALITY_SAFE=$(sed_escape "${PERSONALITY}")
 MISSION_SAFE=$(sed_escape "${MISSION}")
+PARENT_WISDOM_SAFE=$(sed_escape "${PARENT_WISDOM}")
 
 # Template placeholder replacement — uses | delimiter with sed
 replace_placeholders() {
@@ -406,7 +432,9 @@ replace_placeholders() {
         | sed "s|__CREATED_AT__|${CREATED_AT}|g" \
         | sed "s|__WEBCHAT_URL__|${WEBCHAT_URL}|g" \
         | sed "s|__PERSONALITY__|${PERSONALITY_SAFE}|g" \
-        | sed "s|__MISSION__|${MISSION_SAFE}|g"
+        | sed "s|__MISSION__|${MISSION_SAFE}|g" \
+        | sed "s|__PARENT_WISDOM__|${PARENT_WISDOM_SAFE}|g" \
+        | sed "s|__DEFAULT_MODEL__|${DEFAULT_MODEL}|g"
 }
 
 TEMPLATES_WRITTEN=0
@@ -450,7 +478,7 @@ echo "  ${TEMPLATES_WRITTEN} workspace files written"
 # 10. Provision PPQ.ai LLM account (if no key provided externally)
 # ------------------------------------------------------------------
 echo ""
-echo "[10/14] Provisioning PPQ.ai LLM account..."
+echo "[10/15] Provisioning PPQ.ai LLM account..."
 
 PPQ_CREDENTIALS="/opt/agent-keys/ppq_credentials.json"
 if [ -n "${PAYPERQ_KEY}" ]; then
@@ -480,7 +508,7 @@ fi
 # 11. Install npm packages (mcp-money, NDK)
 # ------------------------------------------------------------------
 echo ""
-echo "[11/14] Installing npm packages..."
+echo "[11/15] Installing npm packages..."
 npm install -g --production mcp-money 2>/dev/null || echo "  mcp-money install skipped"
 
 mkdir -p /opt/agent-ndk && cd /opt/agent-ndk
@@ -495,7 +523,7 @@ npm cache clean --force 2>/dev/null || true
 # 12. NIP-46 Nostr Connect bunker (NDKNip46Backend)
 # ------------------------------------------------------------------
 echo ""
-echo "[12/14] Setting up NIP-46 bunker (NDK backend)..."
+echo "[12/15] Setting up NIP-46 bunker (NDK backend)..."
 
 # Copy scripts to keys directory
 if [ -f "${BOOTSTRAP_DIR}/nip46-server.js" ]; then
@@ -537,13 +565,49 @@ echo "  NIP-46 bunker service installed"
 # 13. Install and configure OpenClaw
 # ------------------------------------------------------------------
 echo ""
-echo "[13/14] Installing OpenClaw..."
+echo "[13/15] Installing OpenClaw..."
 
-# Primary: official installer
-curl -fsSL https://openclaw.ai/install.sh | bash 2>/dev/null || \
-    # Fallback: direct npm global install
-    npm install -g --production openclaw@latest 2>/dev/null || \
-    echo "  WARNING: OpenClaw install failed — needs manual setup"
+OPENCLAW_INSTALLED=false
+
+# Stage 1: npm global install (primary — Node 22 satisfies >=22.12.0 requirement)
+if npm install -g --production openclaw@latest 2>/dev/null; then
+    echo "  OpenClaw installed via npm"
+    OPENCLAW_INSTALLED=true
+fi
+
+# Stage 2: git clone + npm install from source
+if [ "$OPENCLAW_INSTALLED" = false ]; then
+    echo "  npm global failed, trying git clone..."
+    if git clone --depth 1 https://github.com/openclaw/openclaw.git /tmp/openclaw-build 2>/dev/null; then
+        cd /tmp/openclaw-build
+        if npm install --production 2>/dev/null && npm link 2>/dev/null; then
+            echo "  OpenClaw installed via git clone + npm link"
+            OPENCLAW_INSTALLED=true
+        fi
+        cd /
+        rm -rf /tmp/openclaw-build
+    fi
+fi
+
+# Stage 3: Docker fallback (isolation, no Node version dependency)
+if [ "$OPENCLAW_INSTALLED" = false ] && command -v docker &>/dev/null; then
+    echo "  Source build failed, trying Docker..."
+    if docker pull ghcr.io/phioranex/openclaw-docker:latest 2>/dev/null; then
+        OPENCLAW_IMAGE="ghcr.io/phioranex/openclaw-docker:latest"
+        echo "  OpenClaw Docker image pulled: ${OPENCLAW_IMAGE}"
+        cat > /usr/local/bin/openclaw << WRAPEOF
+#!/bin/bash
+exec docker run --rm -v /home/agent/.openclaw:/root/.openclaw --network host ${OPENCLAW_IMAGE} "\$@"
+WRAPEOF
+        chmod +x /usr/local/bin/openclaw
+        OPENCLAW_INSTALLED=true
+        echo "  OpenClaw available via Docker wrapper at /usr/local/bin/openclaw"
+    fi
+fi
+
+if [ "$OPENCLAW_INSTALLED" = false ]; then
+    echo "  WARNING: OpenClaw install failed on all methods — needs manual setup"
+fi
 
 # Write config
 if [ -f "${BOOTSTRAP_DIR}/config_template.json" ]; then
@@ -574,7 +638,7 @@ if [ -n "${PAYPERQ_KEY}" ]; then
     "provider": "openai",
     "mode": "token",
     "token": "${PAYPERQ_KEY}",
-    "baseUrl": "https://api.ppq.ai"
+    "baseUrl": "${LLM_BASE_URL}"
   }
 }
 AUTHEOF
@@ -583,28 +647,127 @@ fi
 
 chown -R agent:agent "${OPENCLAW_DIR}"
 
-# Start OpenClaw
-sudo -u agent openclaw gateway start 2>/dev/null || {
-    echo "  openclaw CLI not in PATH — may need manual start"
-}
+# Create systemd service for OpenClaw gateway
+cat > /etc/systemd/system/agent-openclaw.service << 'OCSVCEOF'
+[Unit]
+Description=Agent OpenClaw Gateway
+After=network-online.target agent-bunker.service
+Wants=network-online.target
 
+[Service]
+Type=simple
+User=agent
+WorkingDirectory=/home/agent/.openclaw
+ExecStart=/usr/local/bin/openclaw gateway start
+Restart=on-failure
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+OCSVCEOF
+
+systemctl daemon-reload
+systemctl enable agent-openclaw
+
+if [ "$OPENCLAW_INSTALLED" = true ]; then
+    systemctl start agent-openclaw 2>/dev/null || echo "  OpenClaw start deferred"
+else
+    echo "  OpenClaw service installed but not started (install failed)"
+fi
+
+# Health check
 echo "  Waiting for health check..."
 HEALTH_OK=false
-for i in $(seq 1 12); do
-    if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
-        echo "  Health check PASSED (attempt $i)"
-        HEALTH_OK=true
-        break
-    fi
-    sleep 10
-done
-[ "$HEALTH_OK" = false ] && echo "  WARNING: Health check failed — may still be booting"
+if [ "$OPENCLAW_INSTALLED" = true ]; then
+    for i in $(seq 1 12); do
+        if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
+            echo "  Health check PASSED (attempt $i)"
+            HEALTH_OK=true
+            break
+        fi
+        sleep 10
+    done
+    [ "$HEALTH_OK" = false ] && echo "  WARNING: Health check failed — may still be booting"
+else
+    echo "  Health check skipped (OpenClaw not installed)"
+fi
 
 # ------------------------------------------------------------------
-# 14. Send birth note to parent
+# 14. Install Caddy reverse proxy for HTTPS (ISSUE-002)
 # ------------------------------------------------------------------
 echo ""
-echo "[14/14] Sending birth note to parent..."
+echo "[14/15] Setting up Caddy reverse proxy (HTTPS)..."
+
+CADDY_OK=false
+
+# Install Caddy
+if command -v caddy &>/dev/null; then
+    echo "  Caddy already installed: $(caddy version)"
+else
+    # Add Caddy official repo
+    apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl >/dev/null 2>&1
+    curl -1sLf 'https://dl.cloudflare.com/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null
+    curl -1sLf 'https://dl.cloudflare.com/caddy/stable/deb/debian/config' | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y -qq caddy >/dev/null 2>&1
+    echo "  Caddy installed: $(caddy version 2>/dev/null || echo 'unknown')"
+fi
+
+# Wait for DNS to resolve before requesting a cert (SA-013)
+echo "  Waiting for DNS (${NOSCHA_DOMAIN})..."
+DNS_OK=false
+for i in $(seq 1 24); do
+    if host "${NOSCHA_DOMAIN}" 1.1.1.1 >/dev/null 2>&1; then
+        echo "  DNS resolved (attempt $i)"
+        DNS_OK=true
+        break
+    fi
+    sleep 5
+done
+if [ "$DNS_OK" = false ]; then
+    echo "  WARNING: DNS for ${NOSCHA_DOMAIN} not resolving — Caddy may fail to get cert"
+fi
+
+# Write Caddyfile
+cat > /etc/caddy/Caddyfile << CADDYEOF
+# Default catch-all — drop connections to unknown hosts (SA-012)
+:443 {
+    tls internal
+    respond 444
+}
+
+# Agent webchat — reverse proxy to OpenClaw on localhost:3000
+${NOSCHA_DOMAIN} {
+    reverse_proxy localhost:3000
+}
+CADDYEOF
+
+echo "  Caddyfile written for ${NOSCHA_DOMAIN} → localhost:3000"
+
+# Start Caddy
+systemctl enable caddy >/dev/null 2>&1
+systemctl restart caddy 2>/dev/null || echo "  WARNING: Caddy failed to start"
+
+# Verify Caddy started
+sleep 3
+if systemctl is-active --quiet caddy; then
+    echo "  Caddy running — HTTPS enabled"
+    CADDY_OK=true
+    # Update webchat URL to use HTTPS
+    WEBCHAT_URL="https://${NOSCHA_DOMAIN}"
+else
+    echo "  WARNING: Caddy not running — falling back to HTTP"
+    echo "  Check: journalctl -u caddy --no-pager -n 20"
+    WEBCHAT_URL="http://${VPS_IP}:3000"
+fi
+
+# ------------------------------------------------------------------
+# 15. Send birth note to parent
+# ------------------------------------------------------------------
+echo ""
+echo "[15/15] Sending birth note to parent..."
 
 BIRTH_NOTE_SENT=false
 if [ -f "${KEYS_DIR}/send_birth_note.js" ] && [ -n "${PARENT_NPUB}" ]; then
@@ -650,15 +813,19 @@ chmod 600 "${AGENT_SSH_DIR}/id_ed25519"
 chmod 644 "${AGENT_SSH_DIR}/id_ed25519.pub"
 
 # Overwrite authorized_keys in all possible locations to remove provisioning keys
-for AK_DIR in /home/ubuntu/.ssh /root/.ssh; do
-    if [ -d "$AK_DIR" ]; then
-        # Replace with empty file — provisioning key no longer authorized
-        : > "${AK_DIR}/authorized_keys"
-        chmod 600 "${AK_DIR}/authorized_keys"
-        echo "  Cleared ${AK_DIR}/authorized_keys"
-    fi
-done
-echo "  Provisioning SSH keys removed (authorized_keys regenerated)"
+if [ "${KEEP_SSH}" = "true" ]; then
+    echo "  KEEP_SSH=true — preserving provisioning SSH keys in authorized_keys"
+else
+    for AK_DIR in /home/ubuntu/.ssh /root/.ssh; do
+        if [ -d "$AK_DIR" ]; then
+            # Replace with empty file — provisioning key no longer authorized
+            : > "${AK_DIR}/authorized_keys"
+            chmod 600 "${AK_DIR}/authorized_keys"
+            echo "  Cleared ${AK_DIR}/authorized_keys"
+        fi
+    done
+    echo "  Provisioning SSH keys removed (authorized_keys regenerated)"
+fi
 echo "  Agent SSH key generated at ${AGENT_SSH_DIR}/id_ed25519"
 
 # noscha renewal cron — token stored in file, not in crontab command line
@@ -691,6 +858,8 @@ cat > "${BOOTSTRAP_DIR}/agent_public_info.json" << INFOEOF
   "eth_address": "${ETH_ADDRESS}",
   "vps_ip": "${VPS_IP}",
   "webchat_url": "${WEBCHAT_URL}",
+  "openclaw_installed": ${OPENCLAW_INSTALLED},
+  "caddy_ok": ${CADDY_OK},
   "health_ok": ${HEALTH_OK},
   "birth_note_sent": ${BIRTH_NOTE_SENT},
   "noscha_domain": "${NOSCHA_DOMAIN}",
