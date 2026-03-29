@@ -29,5 +29,21 @@
   "webchat": {
     "enabled": true,
     "port": 3000
+  },
+  "plugins": {
+    "@openclaw/nostr": {
+      "enabled": true,
+      "relays": [
+        "wss://relay.damus.io",
+        "wss://relay.primal.net",
+        "wss://nos.lol"
+      ],
+      "signer": "nip46",
+      "bunkerConnection": "__BUNKER_CONNECTION__",
+      "dm": {
+        "allowFrom": ["__PARENT_NPUB__"],
+        "pairingMode": true
+      }
+    }
   }
 }

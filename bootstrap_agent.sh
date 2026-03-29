@@ -88,6 +88,7 @@ PERSONALITY=$(cat "${BOOTSTRAP_DIR}/personality.txt" 2>/dev/null || echo "profes
 MISSION=$(cat "${BOOTSTRAP_DIR}/mission.txt" 2>/dev/null || echo "")
 PARENT_WISDOM=$(cat "${BOOTSTRAP_DIR}/parent_wisdom.txt" 2>/dev/null || echo "Trust your instincts. Verify everything. Keep your keys safe.")
 LLM_BASE_URL=$(cat "${BOOTSTRAP_DIR}/llm_base_url.txt" 2>/dev/null || echo "https://api.ppq.ai")
+PPQ_CREDIT_USD=$(cat "${BOOTSTRAP_DIR}/ppq_credit_usd.txt" 2>/dev/null || echo "10")
 KEEP_SSH=$(cat "${BOOTSTRAP_DIR}/keep_ssh.txt" 2>/dev/null || echo "false")
 VM_ID=$(cat "${BOOTSTRAP_DIR}/vm_id.txt" 2>/dev/null || echo "")
 DATE=$(date -u +%Y-%m-%d)
@@ -671,6 +672,13 @@ if [ -f "${BOOTSTRAP_DIR}/renew_vm.py" ]; then
     chmod 755 "${KEYS_DIR}/renew_vm.py"
     echo "  ✓ renew_vm.py installed to ${KEYS_DIR}/"
 fi
+# Persist parent npub for heartbeat alerts and Nostr plugin DM policy (ISSUE-005)
+if [ -n "${PARENT_NPUB}" ]; then
+    echo "${PARENT_NPUB}" > "${KEYS_DIR}/parent_npub.txt"
+    chmod 600 "${KEYS_DIR}/parent_npub.txt"
+    chown root:root "${KEYS_DIR}/parent_npub.txt"
+    echo "  ✓ Parent npub saved to ${KEYS_DIR}/parent_npub.txt"
+fi
 
 # Write fallback MEMORY.md only if no custom one was provided via upload
 if [ "$HAS_CUSTOM_MEMORY" = false ]; then
@@ -720,9 +728,11 @@ if [ -n "${PAYPERQ_KEY}" ]; then
     echo "  External PayPerQ key provided — skipping PPQ account creation"
 elif [ -f "${BOOTSTRAP_DIR}/ppq_provision.py" ]; then
     echo "  No external key — creating PPQ account on the agent's behalf..."
-    # Create account only — funding handled separately by provisioning system
+    # Create account + funding invoice — provisioning server pays the bolt11 later
     python3 "${BOOTSTRAP_DIR}/ppq_provision.py" \
-        --create-only \
+        --create-and-invoice \
+        --amount "${PPQ_CREDIT_USD}" \
+        --currency USD \
         --output "${PPQ_CREDENTIALS}" 2>&1 || {
         echo "  WARNING: PPQ provisioning failed"
     }
@@ -731,7 +741,14 @@ elif [ -f "${BOOTSTRAP_DIR}/ppq_provision.py" ]; then
         if [ -n "${PPQ_NEW_KEY}" ]; then
             PAYPERQ_KEY="${PPQ_NEW_KEY}"
             echo "  PPQ account created: ${PAYPERQ_KEY:0:12}..."
-            echo "  ⚡ Account needs funding — Lightning invoice will be created by provisioning system"
+        fi
+        # Surface PPQ bolt11 for create_vm.py to capture in summary
+        PPQ_BOLT11=$(python3 -c "import json; d=json.load(open('${PPQ_CREDENTIALS}')); print(d.get('initial_funding',{}).get('bolt11',''))" 2>/dev/null || echo "")
+        if [ -n "${PPQ_BOLT11}" ]; then
+            echo "  ⚡ PPQ funding invoice created — provisioning server will pay"
+            echo "[BOOTSTRAP_DATA] ppq_bolt11=${PPQ_BOLT11}"
+        else
+            echo "  ⚠ No PPQ bolt11 — account created but invoice creation may have failed"
         fi
         chmod 600 "${PPQ_CREDENTIALS}"
     fi
@@ -887,6 +904,25 @@ else
 }
 CFGEOF
 fi
+# Inject bunker connection string into Nostr plugin config (ISSUE-005)
+# Generated at runtime by nip46-server.js (step 13) — can't be templated ahead of time.
+BUNKER_CONN=""
+for i in $(seq 1 6); do
+    if [ -f "${KEYS_DIR}/bunker_connection.txt" ]; then
+        BUNKER_CONN=$(cat "${KEYS_DIR}/bunker_connection.txt" 2>/dev/null || echo "")
+        break
+    fi
+    [ "$i" -eq 1 ] && echo "  Waiting for bunker connection string..."
+    sleep 5
+done
+if [ -n "${BUNKER_CONN}" ]; then
+    # Bunker URL contains special chars (://?&=) — use pipe delimiter for sed
+    sed -i "s|__BUNKER_CONNECTION__|${BUNKER_CONN}|g" "${OPENCLAW_DIR}/openclaw.json"
+    echo "  ✓ Nostr plugin configured with NIP-46 bunker connection"
+else
+    echo "  WARNING: Bunker connection string not found — Nostr plugin needs manual config"
+fi
+
 chmod 600 "${OPENCLAW_DIR}/openclaw.json"
 
 # Write PayPerQ auth profile
@@ -906,6 +942,16 @@ AUTHEOF
 fi
 
 chown -R agent:agent "${OPENCLAW_DIR}"
+
+# Install Nostr plugin (F2.11 / ISSUE-005)
+if [ "$OPENCLAW_INSTALLED" = true ]; then
+    echo "  Installing Nostr plugin..."
+    if su - agent -c "openclaw plugins install @openclaw/nostr" 2>&1; then
+        echo "  ✓ Nostr plugin installed"
+    else
+        echo "  WARNING: Nostr plugin install failed — agent can install manually"
+    fi
+fi
 
 # Create systemd service for OpenClaw gateway (SA-016: tier-aware limits)
 cat > /etc/systemd/system/agent-openclaw.service << OCSVCEOF
