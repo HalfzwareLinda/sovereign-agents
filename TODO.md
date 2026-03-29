@@ -31,7 +31,7 @@
 
 ### Adopt from ClawHost
 
-- [x] **SA-011: Add swap file to bootstrap** — DONE: 2GB swapfile created in bootstrap Step 1 (before Node.js/OpenClaw install), with `/etc/fstab` persistence and idempotent `/swapfile` existence check.
+- [x] **SA-011: Add swap file to bootstrap** — DONE: 2GB swapfile created in bootstrap Step 2 (system hardening), with `/etc/fstab` persistence and idempotent `/swapfile` existence check.
 
 - [x] **SA-012: Caddy catch-all for unknown Host headers** — DONE: Included in bootstrap step 14 Caddyfile. Default `:443` block with `respond 444` drops connections that don't match the agent's subdomain.
 
@@ -39,11 +39,11 @@
 
 ### Neither stack does (but we should)
 
-- [x] **SA-014: Configure fail2ban SSH jail** — DONE: Jail config written to `/etc/fail2ban/jail.d/sshd.conf` in bootstrap Step 3 (with firewall). Bans IPs after 5 failed SSH attempts for 10 minutes.
+- [x] **SA-014: Configure fail2ban SSH jail** — DONE: Jail config written to `/etc/fail2ban/jail.d/sshd.conf` in bootstrap Step 2 (system hardening). Bans IPs after 5 failed SSH attempts for 10 minutes.
 
-- [x] **SA-015: Kernel hardening via sysctl** — DONE: Three params written to `/etc/sysctl.d/99-agent-hardening.conf` in bootstrap Step 3: rp_filter, no source routing, full ASLR.
+- [x] **SA-015: Kernel hardening via sysctl** — DONE: Three params written to `/etc/sysctl.d/99-agent-hardening.conf` in bootstrap Step 2 (system hardening): rp_filter, no source routing, full ASLR.
 
-- [x] **SA-016: systemd resource limits on agent services** — DONE: OpenClaw service capped at `MemoryMax=1536M` / `CPUQuota=80%`, bunker at `MemoryMax=512M` / `CPUQuota=50%`. Safety nets for 2 CPU / 2GB hardware — prevents runaway processes from starving SSH.
+- [x] **SA-016: systemd resource limits on agent services** — DONE: Tier-aware limits via case statement — e.g. seed/evolve: OpenClaw `MemoryMax=1536M`/`CPUQuota=80%`, bunker `MemoryMax=512M`/`CPUQuota=50%`; dynasty scales up to 3072M. Prevents runaway processes from starving SSH.
 
 - [ ] **SA-017: Ship auth/syslog to agent health Nostr events** — Logs currently stay on the VPS and are lost if the VPS dies or is compromised. Neither stack does centralized logging. For Sovereign Agents, the natural approach is publishing periodic health-check events over Nostr (e.g. a NIP-70 kind or custom kind) — uptime, failed SSH attempts, disk usage, service status. This gives the parent visibility without SSH access, and aligns with the "sovereign but observable" principle. Lower priority than the above items.
 

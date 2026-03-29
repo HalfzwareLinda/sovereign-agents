@@ -99,10 +99,41 @@ echo "  Tier:   ${TIER}"
 echo "  Parent: ${PARENT_NPUB}"
 
 # ------------------------------------------------------------------
+# SA-016: Tier-aware resource limits for systemd services
+# Sized relative to VPS hardware per tier.
+# ------------------------------------------------------------------
+case "${TIER}" in
+    trial)
+        LIMIT_OPENCLAW_MEM="768M"
+        LIMIT_OPENCLAW_CPU="80%"
+        LIMIT_BUNKER_MEM="256M"
+        LIMIT_BUNKER_CPU="50%"
+        ;;
+    seed|evolve)
+        LIMIT_OPENCLAW_MEM="1536M"
+        LIMIT_OPENCLAW_CPU="80%"
+        LIMIT_BUNKER_MEM="512M"
+        LIMIT_BUNKER_CPU="50%"
+        ;;
+    dynasty)
+        LIMIT_OPENCLAW_MEM="3072M"
+        LIMIT_OPENCLAW_CPU="80%"
+        LIMIT_BUNKER_MEM="512M"
+        LIMIT_BUNKER_CPU="50%"
+        ;;
+    *)
+        LIMIT_OPENCLAW_MEM="1536M"
+        LIMIT_OPENCLAW_CPU="80%"
+        LIMIT_BUNKER_MEM="512M"
+        LIMIT_BUNKER_CPU="50%"
+        ;;
+esac
+
+# ------------------------------------------------------------------
 # 1. System packages
 # ------------------------------------------------------------------
 echo ""
-echo "[1/15] Installing system packages..."
+echo "[1/16] Installing system packages..."
 if should_skip_step 1; then
     true  # skip
 else
@@ -125,7 +156,17 @@ else
     rm -rf /var/lib/apt/lists/* /usr/src/ /root/.cache/pip 2>/dev/null || true
 
     dpkg-reconfigure -f noninteractive unattended-upgrades 2>/dev/null || true
+    mark_step_done 1
+fi
 
+# ------------------------------------------------------------------
+# 2. System hardening (SA-011, SA-014, SA-015)
+# ------------------------------------------------------------------
+echo ""
+echo "[2/16] Hardening system (swap, fail2ban, sysctl)..."
+if should_skip_step 2; then
+    true  # skip
+else
     # --- SA-011: Swap file (OOM safety valve) ---
     if [ ! -f /swapfile ]; then
         fallocate -l 2G /swapfile
@@ -137,44 +178,6 @@ else
     else
         echo "  Swap: already exists — skipping"
     fi
-
-    mark_step_done 1
-fi
-
-# ------------------------------------------------------------------
-# 2. Install Node.js v22+ (LTS — required by OpenClaw)
-# ------------------------------------------------------------------
-echo ""
-echo "[2/15] Installing Node.js..."
-if should_skip_step 2; then
-    true  # skip
-else
-    if ! command -v node &>/dev/null || [[ $(node -v | cut -d'.' -f1 | tr -d 'v') -lt 22 ]]; then
-        curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-        apt-get install -y -qq nodejs
-        apt-get clean
-        rm -rf /var/lib/apt/lists/*
-    fi
-    echo "  Node.js $(node -v), npm $(npm -v)"
-    mark_step_done 2
-fi
-
-# ------------------------------------------------------------------
-# 3. Firewall
-# ------------------------------------------------------------------
-echo ""
-echo "[3/15] Configuring firewall..."
-if should_skip_step 3; then
-    true  # skip
-else
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw allow 22/tcp    comment 'SSH'
-    ufw allow 3000/tcp  comment 'OpenClaw webchat'
-    ufw allow 443/tcp   comment 'HTTPS'
-    ufw allow 80/tcp    comment 'HTTP'
-    ufw --force enable
-    echo "  Ports open: 22, 80, 443, 3000"
 
     # --- SA-014: fail2ban SSH jail ---
     mkdir -p /etc/fail2ban/jail.d
@@ -197,27 +200,64 @@ SYSEOF
     sysctl --system > /dev/null 2>&1 || true
     echo "  sysctl: kernel hardening applied"
 
+    mark_step_done 2
+fi
+
+# ------------------------------------------------------------------
+# 3. Install Node.js v22+ (LTS — required by OpenClaw)
+# ------------------------------------------------------------------
+echo ""
+echo "[3/16] Installing Node.js..."
+if should_skip_step 3; then
+    true  # skip
+else
+    if ! command -v node &>/dev/null || [[ $(node -v | cut -d'.' -f1 | tr -d 'v') -lt 22 ]]; then
+        curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+        apt-get install -y -qq nodejs
+        apt-get clean
+        rm -rf /var/lib/apt/lists/*
+    fi
+    echo "  Node.js $(node -v), npm $(npm -v)"
     mark_step_done 3
 fi
 
 # ------------------------------------------------------------------
-# 4. Create agent user
+# 4. Firewall
 # ------------------------------------------------------------------
 echo ""
-echo "[4/15] Creating agent user..."
+echo "[4/16] Configuring firewall..."
 if should_skip_step 4; then
     true  # skip
 else
-    useradd -m -s /bin/bash agent 2>/dev/null || true
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw allow 22/tcp    comment 'SSH'
+    ufw allow 3000/tcp  comment 'OpenClaw webchat'
+    ufw allow 443/tcp   comment 'HTTPS'
+    ufw allow 80/tcp    comment 'HTTP'
+    ufw --force enable
+    echo "  Ports open: 22, 80, 443, 3000"
     mark_step_done 4
 fi
 
 # ------------------------------------------------------------------
-# 5. Generate Nostr keypair ON THIS MACHINE
+# 5. Create agent user
 # ------------------------------------------------------------------
 echo ""
-echo "[5/15] Generating Nostr identity (keys born here, stay here)..."
-if should_skip_step 5 || [ -f "${KEYS_DIR}/nostr.json" ]; then
+echo "[5/16] Creating agent user..."
+if should_skip_step 5; then
+    true  # skip
+else
+    useradd -m -s /bin/bash agent 2>/dev/null || true
+    mark_step_done 5
+fi
+
+# ------------------------------------------------------------------
+# 6. Generate Nostr keypair ON THIS MACHINE
+# ------------------------------------------------------------------
+echo ""
+echo "[6/16] Generating Nostr identity (keys born here, stay here)..."
+if should_skip_step 6 || [ -f "${KEYS_DIR}/nostr.json" ]; then
     # Keys already exist — load them instead of regenerating
     if [ -f "${KEYS_DIR}/nostr.json" ]; then
         echo "  Nostr keys already exist at ${KEYS_DIR}/nostr.json — reusing"
@@ -225,7 +265,7 @@ if should_skip_step 5 || [ -f "${KEYS_DIR}/nostr.json" ]; then
         AGENT_NPUB=$(jq -r '.npub' "${KEYS_DIR}/nostr.json")
         AGENT_PRIVKEY_HEX=$(jq -r '.private_key_hex' "${KEYS_DIR}/nostr.json")
         AGENT_PUBKEY_HEX=$(jq -r '.public_key_hex' "${KEYS_DIR}/nostr.json")
-        mark_step_done 5
+        mark_step_done 6
     fi
 else
 
@@ -295,15 +335,15 @@ AGENT_PUBKEY_HEX=$(echo "$NOSTR_KEYS_JSON" | jq -r '.public_key_hex')
 
 echo "  npub: ${AGENT_NPUB}"
 echo "  nsec: [REDACTED — generated and stored locally only]"
-mark_step_done 5
-fi  # end of step 5 idempotency guard
+mark_step_done 6
+fi  # end of step 6 idempotency guard
 
 # ------------------------------------------------------------------
-# 6. Generate BTC wallet
+# 7. Generate BTC wallet
 # ------------------------------------------------------------------
 echo ""
-echo "[6/15] Generating BTC wallet..."
-if should_skip_step 6 || [ -f "${KEYS_DIR}/btc_wallet.json" ]; then
+echo "[7/16] Generating BTC wallet..."
+if should_skip_step 7 || [ -f "${KEYS_DIR}/btc_wallet.json" ]; then
     # Wallet already exists — load address
     if [ -f "${KEYS_DIR}/btc_wallet.json" ]; then
         echo "  BTC wallet already exists at ${KEYS_DIR}/btc_wallet.json — reusing"
@@ -311,7 +351,7 @@ if should_skip_step 6 || [ -f "${KEYS_DIR}/btc_wallet.json" ]; then
         BTC_MNEMONIC=$(jq -r '.mnemonic' "${KEYS_DIR}/btc_wallet.json")
         BTC_JSON=$(cat "${KEYS_DIR}/btc_wallet.json")
         echo "  BTC address: ${BTC_ADDRESS}"
-        mark_step_done 6
+        mark_step_done 7
     fi
 else
 
@@ -406,21 +446,21 @@ print(json.dumps({'mnemonic': mnemonic, 'address': address, 'wif': wif, 'derivat
 BTC_ADDRESS=$(echo "$BTC_JSON" | jq -r '.address')
 BTC_MNEMONIC=$(echo "$BTC_JSON" | jq -r '.mnemonic')
 echo "  BTC address: ${BTC_ADDRESS}"
-mark_step_done 6
-fi  # end of step 6 idempotency guard
+mark_step_done 7
+fi  # end of step 7 idempotency guard
 
 # ------------------------------------------------------------------
-# 7. Generate ETH wallet
+# 8. Generate ETH wallet
 # ------------------------------------------------------------------
 echo ""
-echo "[7/15] Generating ETH wallet..."
-if should_skip_step 7 || [ -f "${KEYS_DIR}/eth_wallet.json" ]; then
+echo "[8/16] Generating ETH wallet..."
+if should_skip_step 8 || [ -f "${KEYS_DIR}/eth_wallet.json" ]; then
     if [ -f "${KEYS_DIR}/eth_wallet.json" ]; then
         echo "  ETH wallet already exists at ${KEYS_DIR}/eth_wallet.json — reusing"
         ETH_ADDRESS=$(jq -r '.address' "${KEYS_DIR}/eth_wallet.json")
         ETH_JSON=$(cat "${KEYS_DIR}/eth_wallet.json")
         echo "  ETH address: ${ETH_ADDRESS}"
-        mark_step_done 7
+        mark_step_done 8
     fi
 else
 
@@ -442,15 +482,15 @@ ETH_ADDRESS=$(echo "$ETH_JSON" | jq -r '.address')
 echo "  ETH address: ${ETH_ADDRESS}"
 
 rm -rf /root/.cache/pip 2>/dev/null || true
-mark_step_done 7
-fi  # end of step 7 idempotency guard
+mark_step_done 8
+fi  # end of step 8 idempotency guard
 
 # ------------------------------------------------------------------
-# 8. Secure key storage
+# 9. Secure key storage
 # ------------------------------------------------------------------
 echo ""
-echo "[8/15] Securing private keys..."
-if should_skip_step 8; then
+echo "[9/16] Securing private keys..."
+if should_skip_step 9; then
     true  # skip
 else
 mkdir -p "${KEYS_DIR}"
@@ -521,14 +561,14 @@ PUBEOF
 chown agent:agent "${KEYS_DIR}/agent_public.json"
 chmod 644 "${KEYS_DIR}/agent_public.json"
 echo "    agent_public.json (agent:agent, 644 — public info only)"
-mark_step_done 8
-fi  # end of step 8
+mark_step_done 9
+fi  # end of step 9
 
 # ------------------------------------------------------------------
-# 9. Process workspace templates (EARLY — before anything else can fail)
+# 10. Process workspace templates (EARLY — before anything else can fail)
 # ------------------------------------------------------------------
 echo ""
-echo "[9/15] Writing workspace templates..."
+echo "[10/16] Writing workspace templates..."
 
 # These vars are needed by later steps regardless of whether step 9 runs
 VPS_IP=$(curl -4 -sf ifconfig.me || echo "unknown")
@@ -538,7 +578,7 @@ CREATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 WEBCHAT_URL="http://${VPS_IP}:3000"
 OPENCLAW_DIR="/home/agent/.openclaw"
 
-if should_skip_step 9; then
+if should_skip_step 10; then
     true  # skip
 else
 
@@ -659,15 +699,15 @@ if [ -f "${BOOTSTRAP_DIR}/custom_templates.json" ]; then
 fi
 
 echo "  ${TEMPLATES_WRITTEN} workspace files written"
-mark_step_done 9
-fi  # end of step 9
+mark_step_done 10
+fi  # end of step 10
 
 # ------------------------------------------------------------------
-# 10. Provision PPQ.ai LLM account (if no key provided externally)
+# 11. Provision PPQ.ai LLM account (if no key provided externally)
 # ------------------------------------------------------------------
 echo ""
-echo "[10/15] Provisioning PPQ.ai LLM account..."
-if should_skip_step 10; then
+echo "[11/16] Provisioning PPQ.ai LLM account..."
+if should_skip_step 11; then
     # Load existing key if available
     PPQ_CREDENTIALS="/opt/agent-keys/ppq_credentials.json"
     if [ -z "${PAYPERQ_KEY}" ] && [ -f "${PPQ_CREDENTIALS}" ]; then
@@ -698,15 +738,15 @@ elif [ -f "${BOOTSTRAP_DIR}/ppq_provision.py" ]; then
 else
     echo "  No PayPerQ key and no ppq_provision.py — agent will have no LLM access"
 fi
-mark_step_done 10
-fi  # end of step 10
+mark_step_done 11
+fi  # end of step 11
 
 # ------------------------------------------------------------------
-# 11. Install npm packages (mcp-money, NDK)
+# 12. Install npm packages (mcp-money, NDK)
 # ------------------------------------------------------------------
 echo ""
-echo "[11/15] Installing npm packages..."
-if should_skip_step 11; then
+echo "[12/16] Installing npm packages..."
+if should_skip_step 12; then
     true  # skip
 else
     npm install -g --production mcp-money 2>/dev/null || echo "  mcp-money install skipped"
@@ -718,15 +758,15 @@ else
     cd /
 
     npm cache clean --force 2>/dev/null || true
-    mark_step_done 11
+    mark_step_done 12
 fi
 
 # ------------------------------------------------------------------
-# 12. NIP-46 Nostr Connect bunker (NDKNip46Backend)
+# 13. NIP-46 Nostr Connect bunker (NDKNip46Backend)
 # ------------------------------------------------------------------
 echo ""
-echo "[12/15] Setting up NIP-46 bunker (NDK backend)..."
-if should_skip_step 12; then
+echo "[13/16] Setting up NIP-46 bunker (NDK backend)..."
+if should_skip_step 13; then
     true  # skip
 else
 
@@ -740,8 +780,8 @@ if [ -f "${BOOTSTRAP_DIR}/send_birth_note.js" ]; then
     chmod 600 "${KEYS_DIR}/send_birth_note.js"
 fi
 
-# Create systemd service for NIP-46 bunker
-cat > /etc/systemd/system/agent-bunker.service << 'SVCEOF'
+# Create systemd service for NIP-46 bunker (SA-016: tier-aware limits)
+cat > /etc/systemd/system/agent-bunker.service << SVCEOF
 [Unit]
 Description=Agent NIP-46 Nostr Connect Bunker
 After=network-online.target
@@ -754,8 +794,8 @@ Environment=NODE_PATH=/opt/agent-ndk/node_modules
 ExecStart=/usr/bin/node /opt/agent-keys/nip46-server.js
 Restart=on-failure
 RestartSec=15
-MemoryMax=512M
-CPUQuota=50%
+MemoryMax=${LIMIT_BUNKER_MEM}
+CPUQuota=${LIMIT_BUNKER_CPU}
 StandardOutput=journal
 StandardError=journal
 
@@ -767,15 +807,15 @@ systemctl daemon-reload
 systemctl enable agent-bunker
 systemctl start agent-bunker 2>/dev/null || echo "  Bunker start deferred"
 echo "  NIP-46 bunker service installed"
-mark_step_done 12
-fi  # end of step 12
+mark_step_done 13
+fi  # end of step 13
 
 # ------------------------------------------------------------------
-# 13. Install and configure OpenClaw
+# 14. Install and configure OpenClaw
 # ------------------------------------------------------------------
 echo ""
-echo "[13/15] Installing OpenClaw..."
-if should_skip_step 13; then
+echo "[14/16] Installing OpenClaw..."
+if should_skip_step 14; then
     # Need these vars for later steps
     OPENCLAW_INSTALLED=true
     HEALTH_OK=true
@@ -867,8 +907,8 @@ fi
 
 chown -R agent:agent "${OPENCLAW_DIR}"
 
-# Create systemd service for OpenClaw gateway
-cat > /etc/systemd/system/agent-openclaw.service << 'OCSVCEOF'
+# Create systemd service for OpenClaw gateway (SA-016: tier-aware limits)
+cat > /etc/systemd/system/agent-openclaw.service << OCSVCEOF
 [Unit]
 Description=Agent OpenClaw Gateway
 After=network-online.target agent-bunker.service
@@ -881,8 +921,8 @@ WorkingDirectory=/home/agent/.openclaw
 ExecStart=/usr/local/bin/openclaw gateway start
 Restart=on-failure
 RestartSec=15
-MemoryMax=1536M
-CPUQuota=80%
+MemoryMax=${LIMIT_OPENCLAW_MEM}
+CPUQuota=${LIMIT_OPENCLAW_CPU}
 StandardOutput=journal
 StandardError=journal
 
@@ -915,15 +955,15 @@ if [ "$OPENCLAW_INSTALLED" = true ]; then
 else
     echo "  Health check skipped (OpenClaw not installed)"
 fi
-mark_step_done 13
-fi  # end of step 13
+mark_step_done 14
+fi  # end of step 14
 
 # ------------------------------------------------------------------
-# 14. Install Caddy reverse proxy for HTTPS (ISSUE-002)
+# 15. Install Caddy reverse proxy for HTTPS (ISSUE-002)
 # ------------------------------------------------------------------
 echo ""
-echo "[14/15] Setting up Caddy reverse proxy (HTTPS)..."
-if should_skip_step 14; then
+echo "[15/16] Setting up Caddy reverse proxy (HTTPS)..."
+if should_skip_step 15; then
     CADDY_OK=true
 else
 
@@ -974,15 +1014,15 @@ else
     echo "  Check: journalctl -u caddy --no-pager -n 20"
     WEBCHAT_URL="http://${VPS_IP}:3000"
 fi
-mark_step_done 14
-fi  # end of step 14
+mark_step_done 15
+fi  # end of step 15
 
 # ------------------------------------------------------------------
-# 15. Send birth note to parent
+# 16. Send birth note to parent
 # ------------------------------------------------------------------
 echo ""
-echo "[15/15] Sending birth note to parent..."
-if should_skip_step 15; then
+echo "[16/16] Sending birth note to parent..."
+if should_skip_step 16; then
     BIRTH_NOTE_SENT=true
 else
 
@@ -1010,8 +1050,8 @@ if [ -f "${KEYS_DIR}/send_birth_note.js" ] && [ -n "${PARENT_NPUB}" ]; then
 else
     echo "  Skipped (no parent npub or send script missing)"
 fi
-mark_step_done 15
-fi  # end of step 15
+mark_step_done 16
+fi  # end of step 16
 
 # ------------------------------------------------------------------
 # Post-bootstrap: cleanup + finalize
