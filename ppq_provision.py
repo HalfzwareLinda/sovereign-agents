@@ -8,6 +8,7 @@ polls for payment, and saves credentials.
 Usage:
     python3 ppq_provision.py --amount 5000 --currency SATS --output /tmp/ppq_credentials.json
     python3 ppq_provision.py --amount 5000 --currency SATS --nwc "nostr+walletconnect://..." --output creds.json
+    python3 ppq_provision.py --create-and-invoice --amount 10 --currency USD --output /tmp/ppq_credentials.json
     python3 ppq_provision.py --check-balance --credentials /tmp/ppq_credentials.json
     python3 ppq_provision.py --dry-run --output /tmp/ppq_credentials.json
 """
@@ -175,6 +176,35 @@ def cmd_provision(args):
         print(f"\n  Credentials saved: {output_path}")
         return result
 
+    if args.create_and_invoice:
+        # Create invoice but don't wait for payment — provisioning server pays it later
+        amount = args.amount
+        currency = args.currency.upper()
+        print(f"\n[2/2] Creating Lightning invoice ({amount} {currency})...")
+        try:
+            invoice_data = ppq_create_invoice(account["api_key"], amount, currency)
+            bolt11 = invoice_data.get("lightning_invoice", "")
+            invoice_id = invoice_data.get("invoice_id", "")
+            result["initial_funding"] = {
+                "status": "pending",
+                "bolt11": bolt11,
+                "invoice_id": invoice_id,
+                "amount": amount,
+                "currency": currency,
+            }
+            if bolt11:
+                print(f"  Invoice created: {bolt11[:60]}...")
+            else:
+                print(f"  WARNING: No bolt11 in PPQ response: {invoice_data}")
+        except Exception as exc:
+            print(f"  WARNING: Invoice creation failed: {exc}")
+            result["initial_funding"] = {"status": "invoice_failed", "error": str(exc)}
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(result, indent=2))
+        print(f"\n  Credentials saved: {output_path}")
+        return result
+
     # Step 2: Create Lightning invoice
     amount = args.amount
     currency = args.currency.upper()
@@ -299,6 +329,7 @@ def main():
     parser.add_argument("--output", default="/opt/agent-keys/ppq_credentials.json", help="Output credentials file")
     parser.add_argument("--nwc", default="", help="NWC connection string for automatic Lightning payment")
     parser.add_argument("--create-only", action="store_true", help="Create account and save credentials, skip funding")
+    parser.add_argument("--create-and-invoice", action="store_true", help="Create account + funding invoice, but don't wait for payment (provisioning server pays later)")
     parser.add_argument("--dry-run", action="store_true", help="Alias for --create-only")
     parser.add_argument("--check-balance", action="store_true", help="Check balance of existing credentials")
     parser.add_argument("--credentials", default="", help="Path to existing credentials (for --check-balance)")

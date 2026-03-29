@@ -746,7 +746,7 @@ elif [ -f "${BOOTSTRAP_DIR}/ppq_provision.py" ]; then
         PPQ_BOLT11=$(python3 -c "import json; d=json.load(open('${PPQ_CREDENTIALS}')); print(d.get('initial_funding',{}).get('bolt11',''))" 2>/dev/null || echo "")
         if [ -n "${PPQ_BOLT11}" ]; then
             echo "  ⚡ PPQ funding invoice created — provisioning server will pay"
-            echo "[BOOTSTRAP_DATA] ppq_bolt11=${PPQ_BOLT11}"
+            echo "[BOOTSTRAP_DATA] $(python3 -c "import json; print(json.dumps({'ppq_bolt11': '${PPQ_BOLT11}'}))")"
         else
             echo "  ⚠ No PPQ bolt11 — account created but invoice creation may have failed"
         fi

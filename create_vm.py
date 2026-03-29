@@ -78,6 +78,18 @@ LNVPS_API = "https://api.lnvps.net"
 NOSCHA_API = "https://noscha.io/api"
 WEBHOOK_SITE_API = "https://webhook.site"
 
+# Per-tier fund distribution amounts (USD, per agent — multi-agent tiers pre-divided)
+PPQ_CREDIT_USD = {
+    "descendant": {"seed": 10, "evolve": 40, "dynasty": 33},
+    "spawnling":  {"hatch": 10, "raise": 30, "colony": 25},
+    "deadrop":    {"shadow": 15, "phantom": 50, "specter": 50},
+}
+WALLET_SEED_USD = {
+    "descendant": {"seed": 15, "evolve": 25, "dynasty": 17},
+    "spawnling":  {"hatch": 15, "raise": 20, "colony": 10},
+    "deadrop":    {"shadow": 15, "phantom": 25, "specter": 17},
+}
+
 # Brand → NIP-05 domain (self-hosted via Cloudflare Pages + KV)
 NIP05_DOMAINS = {
     "descendant": "descendant.io",
@@ -965,17 +977,31 @@ def ssh_retry_bootstrap(ip, ssh_private_key_pem, resume_from_step, upload_files=
 
 
 def _parse_bootstrap_output(output: str) -> dict | None:
-    """Parse the JSON public info block from bootstrap stdout."""
+    """Parse the JSON public info block and [BOOTSTRAP_DATA] markers from bootstrap stdout."""
     # Bootstrap writes a JSON block between markers
     marker_start = "===AGENT_PUBLIC_INFO_START==="
     marker_end = "===AGENT_PUBLIC_INFO_END==="
+    result = None
     if marker_start in output and marker_end in output:
         json_str = output.split(marker_start)[1].split(marker_end)[0].strip()
         try:
-            return json.loads(json_str)
+            result = json.loads(json_str)
         except json.JSONDecodeError:
             pass
-    return None
+
+    # Also parse [BOOTSTRAP_DATA] JSON lines (e.g. {"ppq_bolt11": "lnbc..."})
+    for line in output.splitlines():
+        if line.strip().startswith("[BOOTSTRAP_DATA] "):
+            payload = line.strip().split("[BOOTSTRAP_DATA] ", 1)[1]
+            try:
+                data = json.loads(payload)
+                if result is None:
+                    result = {}
+                result.update(data)
+            except json.JSONDecodeError:
+                pass
+
+    return result
 
 
 # =============================================================================
@@ -1077,6 +1103,10 @@ def prepare_upload_files(name, parent_npub, tier, brand, model, nip05_domain="",
 
     # NIP-05 domain for this brand (used by bootstrap to set agent identity)
     files["nip05_domain.txt"] = nip05_domain or NIP05_DOMAINS.get(brand, "noscha.io")
+
+    # PPQ credit amount for this tier (USD) — used by bootstrap with --create-and-invoice
+    ppq_credit = PPQ_CREDIT_USD.get(brand, {}).get(tier, 10)
+    files["ppq_credit_usd.txt"] = str(ppq_credit)
 
     # LLM base URL (defaults to PPQ, can be overridden for direct OpenAI etc.)
     if llm_base_url:
@@ -1276,6 +1306,8 @@ def create_vm(args) -> dict:
         "vps_ip": vps_ip,
         "vm_id": vm.get("vm_id", ""),
         "vm_bolt11": vm.get("bolt11", ""),
+        "ppq_bolt11": agent_info.get("ppq_bolt11", "") if agent_info else "",
+        "wallet_seed_usd": WALLET_SEED_USD.get(brand, {}).get(tier, 15),
         "nip05_registered": not bool(nip05_result.get("error")),
         "agent_npub": agent_npub,
         "agent_nip05": nip05,
@@ -1370,6 +1402,8 @@ def retry_vm(args) -> dict:
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "provider": "lnvps",
         "vps_ip": vm_ip,
+        "ppq_bolt11": agent_info.get("ppq_bolt11", ""),
+        "wallet_seed_usd": WALLET_SEED_USD.get(brand, {}).get(tier, 15),
         "agent_npub": agent_info.get("npub", "unknown"),
         "agent_nip05": agent_info.get("nip05", f"{name}@{NIP05_DOMAINS.get(brand, 'noscha.io')}"),
         "agent_btc_address": agent_info.get("btc_address", "unknown"),
