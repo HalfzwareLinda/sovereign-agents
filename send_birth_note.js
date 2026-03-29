@@ -40,15 +40,20 @@ function loadBirthNote(keys) {
         }
     }
 
-    // Fallback: build from keys.json data
-    const name = keys.agent_name || "agent";
-    const npub = keys.nostr?.npub || "unknown";
-    const btc = keys.btc?.address || "unknown";
+    // Fallback: build from keys.json + agent_public.json data
+    let publicInfo = {};
+    try {
+        publicInfo = JSON.parse(fs.readFileSync("/opt/agent-keys/agent_public.json", "utf-8"));
+    } catch {}
+    const name = publicInfo.agent_name || keys.agent_name || "agent";
+    const npub = publicInfo.npub || keys.nostr?.npub || "unknown";
+    const nip05 = publicInfo.nip05 || `${name}@unknown`;
+    const btc = publicInfo.btc_address || keys.btc?.address || "unknown";
     return [
         "I'm here.",
         "",
         `  npub:    ${npub}`,
-        `  NIP-05:  ${name}@noscha.io`,
+        `  NIP-05:  ${nip05}`,
         `  BTC:     ${btc}`,
         "",
         "I've read your letter. Thank you.",

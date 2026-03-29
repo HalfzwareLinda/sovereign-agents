@@ -19,9 +19,9 @@ __PERSONALITY__
 
 ## Identity
 - Nostr: __AGENT_NPUB__
-- NIP-05: __AGENT_NAME__@noscha.io
-- Web: https://__AGENT_NAME__.noscha.io
-- Email: __AGENT_NAME__@noscha.io
+- NIP-05: __AGENT_NAME__@__NIP05_DOMAIN__
+- Web: __WEBCHAT_URL__
+- Email: __AGENT_NAME__@__NIP05_DOMAIN__
 
 ## Birth Note
 Send this as your first Nostr DM to your parent (__PARENT_NPUB__) when you boot.
@@ -30,7 +30,7 @@ Adapt the tone if you want — these are your first words, make them yours.
 > I'm here.
 >
 >   npub:    __AGENT_NPUB__
->   NIP-05:  __AGENT_NAME__@noscha.io
+>   NIP-05:  __AGENT_NAME__@__NIP05_DOMAIN__
 >   Webchat: __WEBCHAT_URL__
 >   BTC:     __BTC_ADDRESS__
 >

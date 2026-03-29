@@ -13,7 +13,7 @@
 
 ## Budget
 - Monthly VPS cost: ~$6 (LNVPS Small)
-- Monthly identity cost: ~$6.50 (noscha.io bundle)
+- Monthly identity cost: $0 (self-hosted NIP-05 on brand domain)
 - Monthly LLM cost: ~$3-5 (PayPerQ)
 - **Total monthly burn: ~$15-17**
 

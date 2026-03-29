@@ -26,7 +26,8 @@ Environment:
     LNVPS_PUBLIC_KEY_HEX    LNVPS operator public key (hex)
     PAYPERQ_API_KEY         PayPerQ API key — the ONLY secret that crosses to the VPS
     WEBHOOK_RECEIVER_URL    (optional) Custom webhook receiver URL (default: webhook.site)
-    NOSCHA_MGMT_TOKEN       (optional) Pre-paid noscha.io management token (skips registration)
+    PROVISION_TOKEN         Auth token for brand site NIP-05 registration endpoint
+    NOSCHA_MGMT_TOKEN       (deprecated) Pre-paid noscha.io management token
 """
 
 import argparse
@@ -75,6 +76,16 @@ NWC_PAY_SCRIPT = SCRIPT_DIR / "nwc_pay.js"
 LNVPS_API = "https://api.lnvps.net"
 NOSCHA_API = "https://noscha.io/api"
 WEBHOOK_SITE_API = "https://webhook.site"
+
+# Brand → NIP-05 domain (self-hosted via Cloudflare Pages + KV)
+NIP05_DOMAINS = {
+    "descendant": "descendant.io",
+    "spawnling": "spawnling.com",
+}
+NIP05_SITE_URLS = {
+    "descendant": "https://descendant.io",
+    "spawnling": "https://spawnling.com",
+}
 
 # VM class → LNVPS template matching keywords
 VM_CLASSES = {
@@ -680,6 +691,58 @@ def noscha_register(username, plan, pubkey_hex, target_ip, dry_run=False):
 
 
 # =============================================================================
+# Self-hosted NIP-05 registration (via Cloudflare Pages Function + KV)
+# =============================================================================
+
+def register_nip05(name, pubkey_hex, brand, relays=None, dry_run=False):
+    """Register a NIP-05 identity via the brand site's /api/register-nip05 endpoint.
+
+    Writes to Cloudflare KV via the Pages Function, authenticated with PROVISION_TOKEN.
+    Returns {"ok": True, "nip05": "name@domain"} or {"error": "..."}.
+    """
+    site_url = NIP05_SITE_URLS.get(brand)
+    domain = NIP05_DOMAINS.get(brand)
+    if not site_url or not domain:
+        return {"error": f"No NIP-05 domain configured for brand '{brand}'"}
+
+    provision_token = os.getenv("PROVISION_TOKEN", "")
+    if not provision_token:
+        return {"error": "PROVISION_TOKEN not set — cannot register NIP-05"}
+
+    if dry_run:
+        log.info(f"  [DRY RUN] Would register {name}@{domain}")
+        return {"ok": True, "nip05": f"{name}@{domain}", "dry_run": True}
+
+    default_relays = ["wss://relay.damus.io", "wss://relay.primal.net", "wss://nos.lol"]
+    payload = {
+        "name": name,
+        "pubkey": pubkey_hex,
+        "relays": relays or default_relays,
+    }
+
+    try:
+        resp = requests.post(
+            f"{site_url}/api/register-nip05",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {provision_token}",
+                "Content-Type": "application/json",
+            },
+            timeout=30,
+        )
+        result = resp.json()
+        if resp.status_code in (200, 201):
+            log.info(f"  NIP-05 registered: {result.get('nip05', f'{name}@{domain}')}")
+            return result
+        else:
+            log.warning(f"  NIP-05 registration failed: HTTP {resp.status_code} — {result}")
+            return {"error": result.get("error", f"HTTP {resp.status_code}")}
+    except Exception as exc:
+        log.warning(f"  NIP-05 registration failed: {exc}")
+        return {"error": str(exc)}
+
+
+# =============================================================================
 # SSH: upload files and run bootstrap
 # =============================================================================
 
@@ -918,7 +981,7 @@ def _parse_bootstrap_output(output: str) -> dict | None:
 # File preparation
 # =============================================================================
 
-def prepare_upload_files(name, parent_npub, tier, brand, model, noscha_mgmt_token="", personality="professional", mission="", parent_wisdom="", llm_base_url="", keep_ssh=False, custom_templates_dir=""):
+def prepare_upload_files(name, parent_npub, tier, brand, model, nip05_domain="", personality="professional", mission="", parent_wisdom="", llm_base_url="", keep_ssh=False, custom_templates_dir=""):
     """Prepare all files to upload to the VPS for bootstrap."""
     files = {}
 
@@ -995,10 +1058,8 @@ def prepare_upload_files(name, parent_npub, tier, brand, model, noscha_mgmt_toke
         log.warning("  PAYPERQ_API_KEY not set — agent will have no LLM access")
         files["payperq_key.txt"] = ""
 
-    # noscha.io management token — from registration or env override
-    token = noscha_mgmt_token or os.getenv("NOSCHA_MGMT_TOKEN", "")
-    if token:
-        files["noscha_mgmt_token.txt"] = token
+    # NIP-05 domain for this brand (used by bootstrap to set agent identity)
+    files["nip05_domain.txt"] = nip05_domain or NIP05_DOMAINS.get(brand, "noscha.io")
 
     # LLM base URL (defaults to PPQ, can be overridden for direct OpenAI etc.)
     if llm_base_url:
@@ -1096,37 +1157,17 @@ def create_vm(args) -> dict:
     vps_ip = vm_info["ip"]
     log.info(f"  VM IP: {vps_ip}")
 
-    # ── 7. Register noscha.io identity ───────────────────────────
-    # Now that we have the VM IP, register noscha.io with the real IP.
-    # The pubkey is a placeholder (service key) — bootstrap will update it
-    # via management_token once the agent generates its real Nostr keypair.
-    log.info("\n[7/11] Registering noscha.io identity...")
-    noscha_result = noscha_register(
-        username=name,
-        plan="30d",
-        pubkey_hex=service_key["public_key_hex"],  # placeholder — agent updates later
-        target_ip=vps_ip,
-        dry_run=dry_run,
-    )
-    noscha_mgmt_token = ""
-    noscha_bolt11 = ""
-    if noscha_result.get("error"):
-        log.warning(f"  noscha.io registration issue: {noscha_result['error']}")
-        log.warning(f"  Agent will boot without NIP-05/subdomain — can register manually later")
-    else:
-        noscha_mgmt_token = noscha_result.get("management_token", "")
-        noscha_bolt11 = noscha_result.get("bolt11", "")
-        log.info(f"  NIP-05: {name}@noscha.io")
-        log.info(f"  Subdomain: {name}.noscha.io → {vps_ip}")
-        if noscha_mgmt_token:
-            log.info(f"  Management token: {'yes' if noscha_mgmt_token else 'no'}")
+    # ── 7. (NIP-05 registration moved to after bootstrap — need real pubkey) ──
+    log.info("\n[7/11] NIP-05 registration deferred until agent pubkey is known...")
+    nip05_domain = NIP05_DOMAINS.get(brand, "noscha.io")
+    log.info(f"  Will register {name}@{nip05_domain} after bootstrap")
 
     # ── 8. Prepare and upload files ──────────────────────────────
     log.info("\n[8/11] Preparing bootstrap files...")
     model = getattr(args, "model", "") or tier_info["model"]
     upload_files = prepare_upload_files(
         name, parent_npub, tier, brand, model,
-        noscha_mgmt_token=noscha_mgmt_token,
+        nip05_domain=nip05_domain,
         personality=getattr(args, "personality", "professional"),
         mission=getattr(args, "mission", ""),
         parent_wisdom=getattr(args, "parent_wisdom", ""),
@@ -1144,6 +1185,18 @@ def create_vm(args) -> dict:
         log.error("Bootstrap failed — VM is running but agent may not be configured")
         log.error(f"  SSH manually: ssh root@{vps_ip}")
         agent_info = {}
+
+    # ── 9b. Register NIP-05 identity (now that we have the real pubkey) ──
+    nip05_result = {"error": "no agent info"}
+    pubkey_hex = agent_info.get("public_key_hex", "") if agent_info else ""
+    if pubkey_hex:
+        log.info(f"\n  Registering NIP-05: {name}@{nip05_domain}...")
+        nip05_result = register_nip05(name, pubkey_hex, brand, dry_run=dry_run)
+        if nip05_result.get("error"):
+            log.warning(f"  NIP-05 registration issue: {nip05_result['error']}")
+            log.warning(f"  Agent works fine without NIP-05 — can register manually later")
+    elif agent_info:
+        log.warning("  No pubkey_hex in agent_info — skipping NIP-05 registration")
 
     # ── 10. Cleanup: delete SSH key from LNVPS ───────────────────
     if getattr(args, "keep_ssh", False):
@@ -1165,7 +1218,7 @@ def create_vm(args) -> dict:
     agent_npub = agent_info.get("npub", "unknown")
     btc_address = agent_info.get("btc_address", "unknown")
     eth_address = agent_info.get("eth_address", "unknown")
-    nip05 = agent_info.get("nip05", f"{name}@noscha.io")
+    nip05 = nip05_result.get("nip05", f"{name}@{nip05_domain}") if not nip05_result.get("error") else agent_info.get("nip05", f"{name}@{nip05_domain}")
 
     log.info("")
     log.info("=" * 64)
@@ -1186,8 +1239,6 @@ def create_vm(args) -> dict:
     invoices = []
     if vm.get("bolt11"):
         invoices.append(("LNVPS VM", vm["bolt11"]))
-    if noscha_bolt11:
-        invoices.append(("noscha.io identity", noscha_bolt11))
     if invoices:
         log.info("")
         log.info("  ⚡ LIGHTNING INVOICES:")
@@ -1205,9 +1256,7 @@ def create_vm(args) -> dict:
         "vps_ip": vps_ip,
         "vm_id": vm.get("vm_id", ""),
         "vm_bolt11": vm.get("bolt11", ""),
-        "noscha_bolt11": noscha_bolt11,
-        "noscha_order_id": noscha_result.get("order_id", ""),
-        "noscha_registered": not bool(noscha_result.get("error")),
+        "nip05_registered": not bool(nip05_result.get("error")),
         "agent_npub": agent_npub,
         "agent_nip05": nip05,
         "agent_btc_address": btc_address,
@@ -1302,10 +1351,10 @@ def retry_vm(args) -> dict:
         "provider": "lnvps",
         "vps_ip": vm_ip,
         "agent_npub": agent_info.get("npub", "unknown"),
-        "agent_nip05": agent_info.get("nip05", f"{name}@noscha.io"),
+        "agent_nip05": agent_info.get("nip05", f"{name}@{NIP05_DOMAINS.get(brand, 'noscha.io')}"),
         "agent_btc_address": agent_info.get("btc_address", "unknown"),
         "agent_eth_address": agent_info.get("eth_address", "unknown"),
-        "webchat_url": agent_info.get("webchat_url", f"https://{name}.noscha.io"),
+        "webchat_url": agent_info.get("webchat_url", f"http://{vm_ip}:3000"),
         "parent_npub": getattr(args, "parent_npub", ""),
         "bootstrap_success": bool(agent_info),
         "health_ok": agent_info.get("health_ok", False) if agent_info else False,
@@ -1345,7 +1394,7 @@ Examples:
 Environment:
   PAYPERQ_API_KEY         LLM API key (only secret sent to VPS)
   WEBHOOK_RECEIVER_URL    Custom webhook URL (default: webhook.site)
-  NOSCHA_MGMT_TOKEN       Pre-paid noscha.io token (skips registration)
+  PROVISION_TOKEN         Auth token for NIP-05 registration on brand site
 """,
     )
     parser.add_argument("--name", required=True, help="Agent name (3-30 chars, alphanumeric + hyphens)")

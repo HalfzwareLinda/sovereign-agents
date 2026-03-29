@@ -8,11 +8,11 @@
 
 ## Nostr
 - **npub:** __AGENT_NPUB__
-- **NIP-05:** __AGENT_NAME__@noscha.io
+- **NIP-05:** __AGENT_NAME__@__NIP05_DOMAIN__
 
 ## Web
-- **Webchat:** https://__AGENT_NAME__.noscha.io
-- **Email:** __AGENT_NAME__@noscha.io
+- **Webchat:** __WEBCHAT_URL__
+- **Email:** __AGENT_NAME__@__NIP05_DOMAIN__
 
 ## Wallet
 - **BTC:** __BTC_ADDRESS__

@@ -12,7 +12,7 @@
 #   tier.txt                Tier name
 #   default_model.txt       Default LLM model
 #   payperq_key.txt         PayPerQ API key (only external secret)
-#   noscha_mgmt_token.txt   (optional) Pre-paid noscha.io management token
+#   nip05_domain.txt        NIP-05 domain for this brand (e.g. descendant.io)
 #   parent_wisdom.txt       (optional) Parent's wisdom for LETTER.md
 #   llm_base_url.txt        (optional) LLM API base URL (default: https://api.ppq.ai)
 #   keep_ssh.txt            (optional) "true" to preserve provisioning SSH keys
@@ -75,7 +75,15 @@ BRAND=$(cat "${BOOTSTRAP_DIR}/brand.txt" 2>/dev/null || echo "descendant")
 TIER=$(cat "${BOOTSTRAP_DIR}/tier.txt" 2>/dev/null || echo "seed")
 DEFAULT_MODEL=$(cat "${BOOTSTRAP_DIR}/default_model.txt" 2>/dev/null || echo "gpt-5-nano")
 PAYPERQ_KEY=$(cat "${BOOTSTRAP_DIR}/payperq_key.txt" 2>/dev/null || echo "")
-NOSCHA_TOKEN=$(cat "${BOOTSTRAP_DIR}/noscha_mgmt_token.txt" 2>/dev/null || echo "")
+NIP05_DOMAIN=$(cat "${BOOTSTRAP_DIR}/nip05_domain.txt" 2>/dev/null || echo "")
+# Derive NIP-05 domain from brand if not explicitly provided
+if [ -z "${NIP05_DOMAIN}" ]; then
+    case "${BRAND}" in
+        descendant) NIP05_DOMAIN="descendant.io" ;;
+        spawnling)  NIP05_DOMAIN="spawnling.com" ;;
+        *)          NIP05_DOMAIN="noscha.io" ;;
+    esac
+fi
 PERSONALITY=$(cat "${BOOTSTRAP_DIR}/personality.txt" 2>/dev/null || echo "professional")
 MISSION=$(cat "${BOOTSTRAP_DIR}/mission.txt" 2>/dev/null || echo "")
 PARENT_WISDOM=$(cat "${BOOTSTRAP_DIR}/parent_wisdom.txt" 2>/dev/null || echo "Trust your instincts. Verify everything. Keep your keys safe.")
@@ -470,7 +478,7 @@ cat > "${KEYS_DIR}/agent_public.json" << PUBEOF
   "btc_address": "${BTC_ADDRESS}",
   "eth_address": "${ETH_ADDRESS}",
   "agent_name": "${AGENT_NAME}",
-  "nip05": "${AGENT_NAME}@noscha.io",
+  "nip05": "${AGENT_NAME}@${NIP05_DOMAIN}",
   "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 PUBEOF
@@ -488,10 +496,10 @@ echo "[9/15] Writing workspace templates..."
 
 # These vars are needed by later steps regardless of whether step 9 runs
 VPS_IP=$(curl -4 -sf ifconfig.me || echo "unknown")
-NOSCHA_DOMAIN="${AGENT_NAME}.noscha.io"
-LN_ADDRESS="${AGENT_NAME}@noscha.io"
+NIP05_ADDRESS="${AGENT_NAME}@${NIP05_DOMAIN}"
+LN_ADDRESS="${AGENT_NAME}@${NIP05_DOMAIN}"
 CREATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-WEBCHAT_URL="https://${AGENT_NAME}.noscha.io"
+WEBCHAT_URL="http://${VPS_IP}:3000"
 OPENCLAW_DIR="/home/agent/.openclaw"
 
 if should_skip_step 9; then
@@ -528,7 +536,8 @@ replace_placeholders() {
         | sed "s|__BTC_ADDRESS__|${BTC_ADDRESS}|g" \
         | sed "s|__ETH_ADDRESS__|${ETH_ADDRESS}|g" \
         | sed "s|__LN_ADDRESS__|${LN_ADDRESS}|g" \
-        | sed "s|__NOSCHA_DOMAIN__|${NOSCHA_DOMAIN}|g" \
+        | sed "s|__NIP05_DOMAIN__|${NIP05_DOMAIN}|g" \
+        | sed "s|__NIP05_ADDRESS__|${NIP05_ADDRESS}|g" \
         | sed "s|__CREATED_AT__|${CREATED_AT}|g" \
         | sed "s|__WEBCHAT_URL__|${WEBCHAT_URL}|g" \
         | sed "s|__PERSONALITY__|${PERSONALITY_SAFE}|g" \
@@ -850,7 +859,6 @@ echo ""
 echo "[14/15] Setting up Caddy reverse proxy (HTTPS)..."
 if should_skip_step 14; then
     CADDY_OK=true
-    WEBCHAT_URL="https://${AGENT_NAME}.noscha.io"
 else
 
 CADDY_OK=false
@@ -868,22 +876,8 @@ else
     echo "  Caddy installed: $(caddy version 2>/dev/null || echo 'unknown')"
 fi
 
-# Wait for DNS to resolve before requesting a cert (SA-013)
-echo "  Waiting for DNS (${NOSCHA_DOMAIN})..."
-DNS_OK=false
-for i in $(seq 1 24); do
-    if host "${NOSCHA_DOMAIN}" 1.1.1.1 >/dev/null 2>&1; then
-        echo "  DNS resolved (attempt $i)"
-        DNS_OK=true
-        break
-    fi
-    sleep 5
-done
-if [ "$DNS_OK" = false ]; then
-    echo "  WARNING: DNS for ${NOSCHA_DOMAIN} not resolving — Caddy may fail to get cert"
-fi
-
-# Write Caddyfile
+# Write Caddyfile — HTTP reverse proxy for OpenClaw on localhost:3000
+# Note: HTTPS requires a domain with DNS pointing here (future: subdomain setup)
 cat > /etc/caddy/Caddyfile << CADDYEOF
 # Default catch-all — drop connections to unknown hosts (SA-012)
 :443 {
@@ -892,12 +886,12 @@ cat > /etc/caddy/Caddyfile << CADDYEOF
 }
 
 # Agent webchat — reverse proxy to OpenClaw on localhost:3000
-${NOSCHA_DOMAIN} {
+:80 {
     reverse_proxy localhost:3000
 }
 CADDYEOF
 
-echo "  Caddyfile written for ${NOSCHA_DOMAIN} → localhost:3000"
+echo "  Caddyfile written for :80 → localhost:3000"
 
 # Start Caddy
 systemctl enable caddy >/dev/null 2>&1
@@ -906,12 +900,11 @@ systemctl restart caddy 2>/dev/null || echo "  WARNING: Caddy failed to start"
 # Verify Caddy started
 sleep 3
 if systemctl is-active --quiet caddy; then
-    echo "  Caddy running — HTTPS enabled"
+    echo "  Caddy running"
     CADDY_OK=true
-    # Update webchat URL to use HTTPS
-    WEBCHAT_URL="https://${NOSCHA_DOMAIN}"
+    WEBCHAT_URL="http://${VPS_IP}"
 else
-    echo "  WARNING: Caddy not running — falling back to HTTP"
+    echo "  WARNING: Caddy not running — falling back to direct port"
     echo "  Check: journalctl -u caddy --no-pager -n 20"
     WEBCHAT_URL="http://${VPS_IP}:3000"
 fi
@@ -935,7 +928,7 @@ if [ -f "${KEYS_DIR}/send_birth_note.js" ] && [ -n "${PARENT_NPUB}" ]; then
         echo "I'm here." > "${BOOTSTRAP_DIR}/birth_note_rendered.txt"
         echo "" >> "${BOOTSTRAP_DIR}/birth_note_rendered.txt"
         echo "  npub:    ${AGENT_NPUB}" >> "${BOOTSTRAP_DIR}/birth_note_rendered.txt"
-        echo "  NIP-05:  ${AGENT_NAME}@noscha.io" >> "${BOOTSTRAP_DIR}/birth_note_rendered.txt"
+        echo "  NIP-05:  ${NIP05_ADDRESS}" >> "${BOOTSTRAP_DIR}/birth_note_rendered.txt"
         echo "  Webchat: ${WEBCHAT_URL}" >> "${BOOTSTRAP_DIR}/birth_note_rendered.txt"
         echo "  BTC:     ${BTC_ADDRESS}" >> "${BOOTSTRAP_DIR}/birth_note_rendered.txt"
         echo "" >> "${BOOTSTRAP_DIR}/birth_note_rendered.txt"
@@ -988,32 +981,12 @@ else
 fi
 echo "  Agent SSH key generated at ${AGENT_SSH_DIR}/id_ed25519"
 
-# noscha renewal cron — token stored in file, not in crontab command line
-# (M3: prevents token exposure via `ps`, /var/spool/cron/crontabs, or process list)
-if [ -n "${NOSCHA_TOKEN}" ]; then
-    NOSCHA_TOKEN_FILE="${KEYS_DIR}/noscha_token"
-    printf '%s' "${NOSCHA_TOKEN}" > "${NOSCHA_TOKEN_FILE}"
-    chmod 600 "${NOSCHA_TOKEN_FILE}"
-    chown root:root "${NOSCHA_TOKEN_FILE}"
-
-    cat > "${KEYS_DIR}/noscha_renew.sh" << 'RENEWEOF'
-#!/bin/bash
-TOKEN=$(cat /opt/agent-keys/noscha_token 2>/dev/null)
-[ -z "$TOKEN" ] && exit 0
-curl -sf -H "Authorization: Bearer ${TOKEN}" https://noscha.io/api/renew >/dev/null 2>&1
-RENEWEOF
-    chmod 700 "${KEYS_DIR}/noscha_renew.sh"
-    chown root:root "${KEYS_DIR}/noscha_renew.sh"
-
-    (crontab -u root -l 2>/dev/null || true; echo "0 0 25 * * /opt/agent-keys/noscha_renew.sh") | crontab -u root -
-    echo "  noscha.io renewal cron set (token in file, not command line)"
-fi
-
 # Write public info for create_vm.py to retrieve
 cat > "${BOOTSTRAP_DIR}/agent_public_info.json" << INFOEOF
 {
   "npub": "${AGENT_NPUB}",
-  "nip05": "${AGENT_NAME}@noscha.io",
+  "public_key_hex": "${AGENT_PUBKEY_HEX}",
+  "nip05": "${NIP05_ADDRESS}",
   "btc_address": "${BTC_ADDRESS}",
   "eth_address": "${ETH_ADDRESS}",
   "vps_ip": "${VPS_IP}",
@@ -1022,7 +995,7 @@ cat > "${BOOTSTRAP_DIR}/agent_public_info.json" << INFOEOF
   "caddy_ok": ${CADDY_OK},
   "health_ok": ${HEALTH_OK},
   "birth_note_sent": ${BIRTH_NOTE_SENT},
-  "noscha_domain": "${NOSCHA_DOMAIN}",
+  "nip05_domain": "${NIP05_DOMAIN}",
   "ln_address": "${LN_ADDRESS}"
 }
 INFOEOF
