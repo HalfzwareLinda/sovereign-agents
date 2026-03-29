@@ -72,6 +72,7 @@ NIP46_SCRIPT = SCRIPT_DIR / "nip46-server.js"
 BIRTH_NOTE_SCRIPT = SCRIPT_DIR / "send_birth_note.js"
 PPQ_PROVISION_SCRIPT = SCRIPT_DIR / "ppq_provision.py"
 NWC_PAY_SCRIPT = SCRIPT_DIR / "nwc_pay.js"
+RENEW_VM_SCRIPT = SCRIPT_DIR / "renew_vm.py"
 
 LNVPS_API = "https://api.lnvps.net"
 NOSCHA_API = "https://noscha.io/api"
@@ -96,7 +97,7 @@ VM_CLASSES = {
 }
 
 TIERS = {
-    "seed":    {"vm_class": "tiny",   "model": "gpt-5-nano"},
+    "seed":    {"vm_class": "small",  "model": "gpt-5-nano"},
     "evolve":  {"vm_class": "small",  "model": "gpt-5-nano"},
     "dynasty": {"vm_class": "medium", "model": "gpt-5-nano"},
     "trial":   {"vm_class": "demo",   "model": "gpt-5-nano"},
@@ -1010,6 +1011,10 @@ def prepare_upload_files(name, parent_npub, tier, brand, model, nip05_domain="",
     if NWC_PAY_SCRIPT.exists():
         files["nwc_pay.js"] = NWC_PAY_SCRIPT.read_text()
 
+    # VM renewal script (copied to agent VPS for self-renewal)
+    if RENEW_VM_SCRIPT.exists():
+        files["renew_vm.py"] = RENEW_VM_SCRIPT.read_text()
+
     # Workspace templates — start with defaults, then overlay custom files
     custom_dir = Path(custom_templates_dir) if custom_templates_dir else None
     custom_files_used = []
@@ -1022,6 +1027,18 @@ def prepare_upload_files(name, parent_npub, tier, brand, model, nip05_domain="",
             log.info(f"  Using custom template: {tmpl.name}")
         else:
             files[f"templates/{tmpl.name}"] = tmpl.read_text()
+
+    # Skill files (templates/skills/*.md)
+    skills_dir = TEMPLATES_DIR / "skills"
+    if skills_dir.is_dir():
+        for skill in sorted(skills_dir.glob("*.md")):
+            # Custom override takes priority
+            if custom_dir and (custom_dir / "skills" / skill.name).exists():
+                files[f"templates/skills/{skill.name}"] = (custom_dir / "skills" / skill.name).read_text()
+                custom_files_used.append(f"skills/{skill.name}")
+                log.info(f"  Using custom skill: {skill.name}")
+            else:
+                files[f"templates/skills/{skill.name}"] = skill.read_text()
 
     # Also include any custom files that don't match a default template name
     # (e.g. agent.md, custom configs)
@@ -1175,6 +1192,9 @@ def create_vm(args) -> dict:
         keep_ssh=getattr(args, "keep_ssh", False),
         custom_templates_dir=getattr(args, "custom_templates_dir", ""),
     )
+    # VM ID — needed by agent for self-renewal (renew_vm.py --vm-id)
+    upload_files["vm_id.txt"] = str(vm["vm_id"])
+
     log.info(f"  {len(upload_files)} files prepared")
 
     # ── 9. SSH bootstrap ─────────────────────────────────────────

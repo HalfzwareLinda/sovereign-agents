@@ -38,6 +38,26 @@ exit 0
 DPKGEOF
 chmod +x /usr/local/bin/dpkg-reconfigure
 
+# Stub out swap commands — Docker lacks swap support
+echo "  Stubbing swap commands for Docker..."
+for cmd in fallocate mkswap swapon; do
+    cat > /usr/local/bin/$cmd << 'EOF'
+#!/bin/bash
+echo "  [DOCKER STUB] $0 $*"
+exit 0
+EOF
+    chmod +x /usr/local/bin/$cmd
+done
+
+# Stub out sysctl — Docker lacks kernel parameter access
+echo "  Stubbing sysctl for Docker..."
+cat > /usr/local/bin/sysctl << 'EOF'
+#!/bin/bash
+echo "  [DOCKER STUB] sysctl $*"
+exit 0
+EOF
+chmod +x /usr/local/bin/sysctl
+
 # Ensure /usr/local/bin is first in PATH so stubs take precedence
 export PATH="/usr/local/bin:$PATH"
 

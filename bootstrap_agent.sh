@@ -89,6 +89,7 @@ MISSION=$(cat "${BOOTSTRAP_DIR}/mission.txt" 2>/dev/null || echo "")
 PARENT_WISDOM=$(cat "${BOOTSTRAP_DIR}/parent_wisdom.txt" 2>/dev/null || echo "Trust your instincts. Verify everything. Keep your keys safe.")
 LLM_BASE_URL=$(cat "${BOOTSTRAP_DIR}/llm_base_url.txt" 2>/dev/null || echo "https://api.ppq.ai")
 KEEP_SSH=$(cat "${BOOTSTRAP_DIR}/keep_ssh.txt" 2>/dev/null || echo "false")
+VM_ID=$(cat "${BOOTSTRAP_DIR}/vm_id.txt" 2>/dev/null || echo "")
 DATE=$(date -u +%Y-%m-%d)
 DISPLAY_NAME=$(echo "${AGENT_NAME}" | sed 's/\b\(.\)/\u\1/g')
 
@@ -124,6 +125,19 @@ else
     rm -rf /var/lib/apt/lists/* /usr/src/ /root/.cache/pip 2>/dev/null || true
 
     dpkg-reconfigure -f noninteractive unattended-upgrades 2>/dev/null || true
+
+    # --- SA-011: Swap file (OOM safety valve) ---
+    if [ ! -f /swapfile ]; then
+        fallocate -l 2G /swapfile
+        chmod 600 /swapfile
+        mkswap /swapfile
+        swapon /swapfile
+        echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        echo "  Swap: 2GB enabled"
+    else
+        echo "  Swap: already exists — skipping"
+    fi
+
     mark_step_done 1
 fi
 
@@ -161,6 +175,28 @@ else
     ufw allow 80/tcp    comment 'HTTP'
     ufw --force enable
     echo "  Ports open: 22, 80, 443, 3000"
+
+    # --- SA-014: fail2ban SSH jail ---
+    mkdir -p /etc/fail2ban/jail.d
+    cat > /etc/fail2ban/jail.d/sshd.conf << 'JAILEOF'
+[sshd]
+enabled = true
+port = ssh
+maxretry = 5
+bantime = 600
+JAILEOF
+    systemctl restart fail2ban 2>/dev/null || true
+    echo "  fail2ban: SSH jail configured (ban after 5 failures, 10 min)"
+
+    # --- SA-015: Kernel hardening (sysctl) ---
+    cat > /etc/sysctl.d/99-agent-hardening.conf << 'SYSEOF'
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.accept_source_route = 0
+kernel.randomize_va_space = 2
+SYSEOF
+    sysctl --system > /dev/null 2>&1 || true
+    echo "  sysctl: kernel hardening applied"
+
     mark_step_done 3
 fi
 
@@ -543,7 +579,8 @@ replace_placeholders() {
         | sed "s|__PERSONALITY__|${PERSONALITY_SAFE}|g" \
         | sed "s|__MISSION__|${MISSION_SAFE}|g" \
         | sed "s|__PARENT_WISDOM__|${PARENT_WISDOM_SAFE}|g" \
-        | sed "s|__DEFAULT_MODEL__|${DEFAULT_MODEL}|g"
+        | sed "s|__DEFAULT_MODEL__|${DEFAULT_MODEL}|g" \
+        | sed "s|__VM_ID__|${VM_ID}|g"
 }
 
 TEMPLATES_WRITTEN=0
@@ -568,6 +605,31 @@ if [ -d "${BOOTSTRAP_DIR}/templates" ]; then
         # Track if a custom MEMORY.md was provided (so we don't overwrite it)
         [[ "$fname" == "MEMORY.md" ]] && HAS_CUSTOM_MEMORY=true
     done
+fi
+
+# Skill files (templates/skills/*.md)
+if [ -d "${BOOTSTRAP_DIR}/templates/skills" ]; then
+    mkdir -p "${OPENCLAW_DIR}/workspace/skills"
+    for tmpl in "${BOOTSTRAP_DIR}/templates/skills/"*.md; do
+        [ ! -f "$tmpl" ] && continue
+        fname=$(basename "$tmpl")
+        replace_placeholders "$(cat "$tmpl")" > "${OPENCLAW_DIR}/workspace/skills/${fname}"
+        TEMPLATES_WRITTEN=$((TEMPLATES_WRITTEN + 1))
+    done
+    echo "  ✓ Skill files written to workspace/skills/"
+fi
+
+# VM ID and renewal script — needed for self-renewal
+if [ -n "${VM_ID}" ]; then
+    echo "${VM_ID}" > "${KEYS_DIR}/vm_id.txt"
+    chmod 600 "${KEYS_DIR}/vm_id.txt"
+    chown root:root "${KEYS_DIR}/vm_id.txt"
+    echo "  ✓ VM ID saved to ${KEYS_DIR}/vm_id.txt"
+fi
+if [ -f "${BOOTSTRAP_DIR}/renew_vm.py" ]; then
+    cp "${BOOTSTRAP_DIR}/renew_vm.py" "${KEYS_DIR}/renew_vm.py"
+    chmod 755 "${KEYS_DIR}/renew_vm.py"
+    echo "  ✓ renew_vm.py installed to ${KEYS_DIR}/"
 fi
 
 # Write fallback MEMORY.md only if no custom one was provided via upload
@@ -692,6 +754,8 @@ Environment=NODE_PATH=/opt/agent-ndk/node_modules
 ExecStart=/usr/bin/node /opt/agent-keys/nip46-server.js
 Restart=on-failure
 RestartSec=15
+MemoryMax=512M
+CPUQuota=50%
 StandardOutput=journal
 StandardError=journal
 
@@ -817,6 +881,8 @@ WorkingDirectory=/home/agent/.openclaw
 ExecStart=/usr/local/bin/openclaw gateway start
 Restart=on-failure
 RestartSec=15
+MemoryMax=1536M
+CPUQuota=80%
 StandardOutput=journal
 StandardError=journal
 
