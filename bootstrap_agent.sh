@@ -538,6 +538,7 @@ replace_placeholders() {
 }
 
 TEMPLATES_WRITTEN=0
+HAS_CUSTOM_MEMORY=false
 if [ -d "${BOOTSTRAP_DIR}/templates" ]; then
     for tmpl in "${BOOTSTRAP_DIR}/templates/"*.md; do
         [ ! -f "$tmpl" ] && continue
@@ -554,11 +555,15 @@ if [ -d "${BOOTSTRAP_DIR}/templates" ]; then
 
         replace_placeholders "$(cat "$tmpl")" > "${OPENCLAW_DIR}/workspace/${fname}"
         TEMPLATES_WRITTEN=$((TEMPLATES_WRITTEN + 1))
+
+        # Track if a custom MEMORY.md was provided (so we don't overwrite it)
+        [[ "$fname" == "MEMORY.md" ]] && HAS_CUSTOM_MEMORY=true
     done
 fi
 
-# Write MEMORY.md
-cat > "${OPENCLAW_DIR}/workspace/MEMORY.md" << MEMEOF
+# Write fallback MEMORY.md only if no custom one was provided via upload
+if [ "$HAS_CUSTOM_MEMORY" = false ]; then
+    cat > "${OPENCLAW_DIR}/workspace/MEMORY.md" << MEMEOF
 # MEMORY.md
 
 Agent **${AGENT_NAME}** born on ${DATE}.
@@ -570,7 +575,17 @@ My parent's letter is in LETTER.md.
 
 Awaiting first instructions.
 MEMEOF
-TEMPLATES_WRITTEN=$((TEMPLATES_WRITTEN + 1))
+    TEMPLATES_WRITTEN=$((TEMPLATES_WRITTEN + 1))
+else
+    echo "  ✓ Using customer-provided MEMORY.md (skipping default)"
+fi
+
+# Copy custom templates provenance marker if present (customer-uploaded files)
+if [ -f "${BOOTSTRAP_DIR}/custom_templates.json" ]; then
+    cp "${BOOTSTRAP_DIR}/custom_templates.json" "${OPENCLAW_DIR}/workspace/custom_templates.json"
+    TEMPLATES_WRITTEN=$((TEMPLATES_WRITTEN + 1))
+    echo "  ✓ Custom templates provenance marker written"
+fi
 
 echo "  ${TEMPLATES_WRITTEN} workspace files written"
 mark_step_done 9

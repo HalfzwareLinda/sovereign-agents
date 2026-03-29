@@ -918,7 +918,7 @@ def _parse_bootstrap_output(output: str) -> dict | None:
 # File preparation
 # =============================================================================
 
-def prepare_upload_files(name, parent_npub, tier, brand, model, noscha_mgmt_token="", personality="professional", mission="", parent_wisdom="", llm_base_url="", keep_ssh=False):
+def prepare_upload_files(name, parent_npub, tier, brand, model, noscha_mgmt_token="", personality="professional", mission="", parent_wisdom="", llm_base_url="", keep_ssh=False, custom_templates_dir=""):
     """Prepare all files to upload to the VPS for bootstrap."""
     files = {}
 
@@ -947,9 +947,35 @@ def prepare_upload_files(name, parent_npub, tier, brand, model, noscha_mgmt_toke
     if NWC_PAY_SCRIPT.exists():
         files["nwc_pay.js"] = NWC_PAY_SCRIPT.read_text()
 
-    # Workspace templates
+    # Workspace templates — start with defaults, then overlay custom files
+    custom_dir = Path(custom_templates_dir) if custom_templates_dir else None
+    custom_files_used = []
+
     for tmpl in sorted(TEMPLATES_DIR.glob("*.md")):
-        files[f"templates/{tmpl.name}"] = tmpl.read_text()
+        # Check if customer provided a custom version of this template
+        if custom_dir and (custom_dir / tmpl.name).exists():
+            files[f"templates/{tmpl.name}"] = (custom_dir / tmpl.name).read_text()
+            custom_files_used.append(tmpl.name)
+            log.info(f"  Using custom template: {tmpl.name}")
+        else:
+            files[f"templates/{tmpl.name}"] = tmpl.read_text()
+
+    # Also include any custom files that don't match a default template name
+    # (e.g. agent.md, custom configs)
+    if custom_dir and custom_dir.exists():
+        for custom_file in sorted(custom_dir.iterdir()):
+            if custom_file.is_file() and custom_file.name not in [t.name for t in TEMPLATES_DIR.glob("*.md")]:
+                files[f"templates/{custom_file.name}"] = custom_file.read_text()
+                custom_files_used.append(custom_file.name)
+                log.info(f"  Including extra custom file: {custom_file.name}")
+
+    # Write provenance metadata so bootstrap knows which files are custom
+    if custom_files_used:
+        import json as _json
+        files["custom_templates.json"] = _json.dumps({
+            "custom_files": custom_files_used,
+            "source": "customer_upload",
+        })
 
     # Input parameters for bootstrap (plain text files — no secrets except PayPerQ key)
     files["agent_name.txt"] = name
@@ -1106,6 +1132,7 @@ def create_vm(args) -> dict:
         parent_wisdom=getattr(args, "parent_wisdom", ""),
         llm_base_url=getattr(args, "llm_base_url", ""),
         keep_ssh=getattr(args, "keep_ssh", False),
+        custom_templates_dir=getattr(args, "custom_templates_dir", ""),
     )
     log.info(f"  {len(upload_files)} files prepared")
 
@@ -1251,6 +1278,7 @@ def retry_vm(args) -> dict:
         parent_wisdom=getattr(args, "parent_wisdom", ""),
         llm_base_url=getattr(args, "llm_base_url", ""),
         keep_ssh=True,  # Keep SSH for further retries if this one also fails
+        custom_templates_dir=getattr(args, "custom_templates_dir", ""),
     )
 
     agent_info = ssh_retry_bootstrap(
@@ -1341,6 +1369,10 @@ Environment:
     # SSH key save path (used by provisioning server to persist key for retry)
     parser.add_argument("--ssh-key-save-path", default="",
                         help="Save SSH private key to this path (for server-managed retry)")
+
+    # Custom templates directory (customer-uploaded agent core files)
+    parser.add_argument("--custom-templates-dir", default="",
+                        help="Directory containing custom template files (SOUL.md, MEMORY.md, etc.) that override defaults from provisioning/templates/")
 
     # Retry mode arguments
     parser.add_argument("--retry", action="store_true",
