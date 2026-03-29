@@ -88,7 +88,7 @@ PROVISION_URL=...            # Provisioning server URL
 ├── nwc-invoice-server.js    # Lightning invoice server (NWC)
 ├── nwc_pay.js               # NWC payment helper
 ├── ppq_provision.py         # PayPerQ account provisioning
-├── nip46-server.js          # NIP-46 remote signer (nsecBunker)
+├── nip46-server.js          # NIP-46 remote signer (NDK-based bunker)
 ├── send_birth_note.js       # Nostr birth announcement
 ├── ln-create-invoice.js     # Netlify function: create invoice
 ├── ln-invoice-status.js     # Netlify function: check invoice status

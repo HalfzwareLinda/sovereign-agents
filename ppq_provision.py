@@ -26,15 +26,17 @@ try:
 except ImportError:
     sys.exit("ERROR: requests not installed. Run: pip install requests")
 
+from retry_request import retry_request, RetryExhaustedError
+
 PPQ_API = "https://api.ppq.ai"
 
 
 def ppq_create_account():
-    """Create a new PPQ account. No auth needed.
+    """Create a new PPQ account. No auth needed. Retries on transient errors.
 
     Returns {"api_key": "sk-...", "credit_id": "...", "balance": 0}
     """
-    resp = requests.post(f"{PPQ_API}/accounts/create", timeout=30)
+    resp = retry_request("POST", f"{PPQ_API}/accounts/create", label="PPQ create-account")
     resp.raise_for_status()
     data = resp.json()
     if not data.get("success") and not data.get("api_key"):
@@ -47,16 +49,17 @@ def ppq_create_account():
 
 
 def ppq_create_invoice(api_key, amount, currency="SATS"):
-    """Create a Lightning invoice for funding.
+    """Create a Lightning invoice for funding. Retries on transient errors.
 
     Returns {"invoice_id": "...", "lightning_invoice": "lnbc...",
              "checkout_url": "...", "expires_at": unix_ts}
     """
-    resp = requests.post(
+    resp = retry_request(
+        "POST",
         f"{PPQ_API}/topup/create/btc-lightning",
         headers={"Authorization": f"Bearer {api_key}"},
         json={"amount": amount, "currency": currency},
-        timeout=30,
+        label="PPQ create-invoice",
     )
     resp.raise_for_status()
     return resp.json()
@@ -100,10 +103,11 @@ def ppq_check_balance(credit_id):
 
     Returns response dict with balance info.
     """
-    resp = requests.post(
+    resp = retry_request(
+        "POST",
         f"{PPQ_API}/credits/balance",
         json={"credit_id": credit_id},
-        timeout=15,
+        label="PPQ check-balance",
     )
     resp.raise_for_status()
     return resp.json()

@@ -92,7 +92,7 @@ Runs on the agent's VPS as root. Generates all secrets locally. Installs full st
 
 ### F2.1 — System Setup
 - **Update:** `apt-get update && apt-get upgrade -y`
-- **Install packages:** `docker.io`, `docker-compose-v2`, `curl`, `jq`, `ufw`, `git`, `unattended-upgrades`, `nodejs` (v20+), `npm`
+- **Install packages:** `docker.io`, `docker-compose-v2`, `curl`, `jq`, `ufw`, `git`, `unattended-upgrades`, `nodejs` (v22+, LTS — required by OpenClaw), `npm`
 - **Auto-updates:** Enable `unattended-upgrades` for security patches
 - **Create user:** `agent` with Docker group membership
 
@@ -169,8 +169,10 @@ Runs on the agent's VPS as root. Generates all secrets locally. Installs full st
 - **Verify:** `curl https://<name>.noscha.io` resolves, NIP-05 `<name>@noscha.io` resolves via `https://noscha.io/.well-known/nostr.json?name=<name>`
 
 ### F2.10 — OpenClaw Installation
-- **Method:** `curl -fsSL https://get.openclaw.ai | bash` (official installer)
-- **Fallback:** Clone repo + Docker compose if installer fails
+- **Method:** Three-stage fallback chain:
+  1. `npm install -g --production openclaw@latest` (primary — requires Node ≥22.12.0)
+  2. `git clone --depth 1 https://github.com/openclaw/openclaw.git` + `npm install` + `npm link` (handles npm registry issues)
+  3. `docker pull ghcr.io/phioranex/openclaw-docker:latest` + wrapper script at `/usr/local/bin/openclaw` (last resort)
 - **Directory:** `~agent/.openclaw/`
 
 ### F2.11 — OpenClaw Configuration
@@ -200,9 +202,9 @@ Runs on the agent's VPS as root. Generates all secrets locally. Installs full st
 - **Permissions:** Owned by `agent:agent`
 
 ### F2.13 — OpenClaw Start
-- **Start:** `sudo -u agent openclaw gateway start`
-- **Fallback:** `docker compose up -d` if CLI unavailable
-- **Health check:** Poll `http://localhost:3000/health` every 10 seconds, max 12 attempts
+- **Start:** Via systemd service `agent-openclaw.service` (runs as `agent` user, depends on `agent-bunker.service`)
+- **ExecStart:** `/usr/local/bin/openclaw gateway start` (works for npm global, npm link, and Docker wrapper)
+- **Health check:** Poll `http://localhost:3000/health` every 10 seconds, max 12 attempts (skipped if install failed)
 - **Success:** HTTP 200 response
 
 ### F2.14 — Birth Note (NIP-17 Gift-Wrap DM)
@@ -502,7 +504,7 @@ Customer pays (Plisio) ──webhook──→ create_vm.py
 
 ### bootstrap_agent.sh (System)
 - `docker.io` + `docker-compose-v2`
-- `nodejs` (v20+) + `npm`
+- `nodejs` (v22+) + `npm`
 - `curl`, `jq`, `git`, `ufw`
 - NPM: `@nostr-dev-kit/ndk`, `@nostr-dev-kit/messages`, `@nostr-dev-kit/wallet`, `@nostr-dev-kit/cache-sqlite`, `mcp-money`
 

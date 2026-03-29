@@ -3,6 +3,8 @@ __pycache__/
 .env
 *.key
 *.nsec
+*.pem
+vm_*_summary.json
 venv/
 .vscode/
 .idea/

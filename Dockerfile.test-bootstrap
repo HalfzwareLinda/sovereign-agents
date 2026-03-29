@@ -1,0 +1,49 @@
+# Dockerfile.test-bootstrap — Simulates a fresh LNVPS Ubuntu 24.04 VM
+#
+# Usage:
+#   docker build -f Dockerfile.test-bootstrap -t sa-bootstrap-test .
+#   docker run --name sa-test sa-bootstrap-test 2>&1 | tee /tmp/bootstrap-docker-test.log
+#
+# After run, inspect:
+#   docker cp sa-test:/opt/agent-keys/ /tmp/sa-test-keys/
+#   docker cp sa-test:/home/agent/.openclaw/ /tmp/sa-test-openclaw/
+#   docker cp sa-test:/var/log/agent-bootstrap.log /tmp/sa-test-bootstrap.log
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Simulate LNVPS default setup (ubuntu user with sudo)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends sudo openssh-server && \
+    (useradd -m -s /bin/bash ubuntu 2>/dev/null || true) && \
+    echo "ubuntu ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Create staging directory (normally done by create_vm.py via SFTP)
+RUN mkdir -p /tmp/agent-bootstrap/templates
+
+# Copy bootstrap script and supporting files
+COPY bootstrap_agent.sh /tmp/agent-bootstrap/bootstrap_agent.sh
+COPY config_template.json /tmp/agent-bootstrap/config_template.json
+COPY nip46-server.js /tmp/agent-bootstrap/nip46-server.js
+COPY send_birth_note.js /tmp/agent-bootstrap/send_birth_note.js
+COPY ppq_provision.py /tmp/agent-bootstrap/ppq_provision.py
+COPY templates/ /tmp/agent-bootstrap/templates/
+
+# Write test input files (simulating what create_vm.py writes)
+RUN echo "testdocker" > /tmp/agent-bootstrap/agent_name.txt && \
+    echo "npub1qy88wumn8ghj7mn0wvhxcmmv9ss9wmnse3yjx5 " > /tmp/agent-bootstrap/parent_npub.txt && \
+    echo "descendant" > /tmp/agent-bootstrap/brand.txt && \
+    echo "seed" > /tmp/agent-bootstrap/tier.txt && \
+    echo "gpt-5-nano" > /tmp/agent-bootstrap/default_model.txt && \
+    echo "" > /tmp/agent-bootstrap/payperq_key.txt && \
+    echo "professional" > /tmp/agent-bootstrap/personality.txt && \
+    echo "Explore and learn" > /tmp/agent-bootstrap/mission.txt && \
+    echo "Trust your instincts. Verify everything. Keep your keys safe." > /tmp/agent-bootstrap/parent_wisdom.txt
+
+# Copy the Docker-compatible wrapper
+COPY test_bootstrap_docker.sh /tmp/agent-bootstrap/test_bootstrap_docker.sh
+RUN chmod +x /tmp/agent-bootstrap/bootstrap_agent.sh /tmp/agent-bootstrap/test_bootstrap_docker.sh
+
+CMD ["bash", "/tmp/agent-bootstrap/test_bootstrap_docker.sh"]
